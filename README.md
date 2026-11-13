@@ -44,7 +44,7 @@ remote-desk/
 ├─ agent/         app.py(GUI+worker)  screen.py  inject.py  clip.py  files_transfer.py  config.py
 ├─ viewer/        app.py(GUI)  client.py(HTTP/WS 客户端)
 ├─ deploy/        Dockerfile  docker-compose.yml  nginx.conf  cloudflared.yml  systemd/
-├─ tests/         11 个测试模块 + smoke_e2e + live_agent_check
+├─ tests/         13 个测试模块 + smoke_e2e + live_agent_check
 └─ start-*.bat    三个启动脚本
 ```
 
