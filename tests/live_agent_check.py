@@ -50,7 +50,7 @@ async def _run() -> int:
         config = RelayConfig(
             viewer_password="live-password",
             agent_key="live-agent-key-0123456789",
-            db_path=f"{{tmp}}/relay.db",
+            db_path=f"{tmp}/relay.db",
         )
         app = create_app(config)
         runner = web.AppRunner(app)
@@ -60,7 +60,7 @@ async def _run() -> int:
         events: "queue.Queue" = queue.Queue()
         commands: "queue.Queue" = queue.Queue()
         agent_config = AgentConfig(
-            relay_url=f"ws://127.0.0.1:{{PORT}}/ws/agent",
+            relay_url=f"ws://127.0.0.1:{PORT}/ws/agent",
             agent_id="live01",
             agent_key=config.agent_key,
             name="Live-Check",
@@ -81,7 +81,7 @@ async def _run() -> int:
                     raise TimeoutError("agent never reached the relay")
                 await asyncio.sleep(0.05)
 
-            client = DeskClient(f"http://127.0.0.1:{{PORT}}", password="live-password")
+            client = DeskClient(f"http://127.0.0.1:{PORT}", password="live-password")
             await client.login()
             agents = await client.list_agents()
             assert any(agent["id"] == "live01" for agent in agents), agents
@@ -97,20 +97,20 @@ async def _run() -> int:
                     if payload.get("t") == "meta":
                         meta = payload
                     elif payload.get("t") == "error":
-                        raise RuntimeError(f"relay error: {{payload.get('code')}}")
+                        raise RuntimeError(f"relay error: {payload.get('code')}")
                     continue
                 if kind == "bin":
                     frames += 1
-                    await session.send_text({{"t": "frame_recv"}})
+                    await session.send_text({"t": "frame_recv"})
 
             await session.close()
             await asyncio.sleep(0.2)
             sessions = await client.list_sessions()
-            assert frames >= FRAMES_WANTED, f"only {{frames}} frames arrived"
-            assert meta and meta.get("width", 0) > 0, f"missing meta: {{meta}}"
+            assert frames >= FRAMES_WANTED, f"only {frames} frames arrived"
+            assert meta and meta.get("width", 0) > 0, f"missing meta: {meta}"
             print(
-                f"live ok: frames={{frames}} desktop={{meta['width']}}x{{meta['height']}} "
-                f"logged={{sessions[0]['frames'] if sessions else 0}}"
+                f"live ok: frames={frames} desktop={meta['width']}x{meta['height']} "
+                f"logged={sessions[0]['frames'] if sessions else 0}"
             )
             return 0
         finally:

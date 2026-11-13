@@ -34,15 +34,15 @@ async def _boot(config: RelayConfig, port: int):
 
 async def _fake_agent(base_ws: str, key: str, frame_payloads: list[bytes], ready: asyncio.Event) -> None:
     async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(f"{{base_ws}}/ws/agent", heartbeat=30, max_msg_size=0) as ws:
+        async with session.ws_connect(f"{base_ws}/ws/agent", heartbeat=30, max_msg_size=0) as ws:
             await ws.send_str(
                 encode(
-                    {{
+                    {
                         "t": "hello",
                         "agent_id": "smoke01",
                         "key": key,
-                        "info": {{"name": "Smoke-PC", "host": "smoke", "os": "Windows", "version": "1.0"}},
-                    }}
+                        "info": {"name": "Smoke-PC", "host": "smoke", "os": "Windows", "version": "1.0"},
+                    }
                 )
             )
             ready.set()
@@ -51,7 +51,7 @@ async def _fake_agent(base_ws: str, key: str, frame_payloads: list[bytes], ready
                     continue
                 decoded = json.loads(message.data)
                 if decoded.get("t") == "session_request":
-                    await ws.send_str(encode({{"t": "session_accept", "sid": decoded["sid"]}}))
+                    await ws.send_str(encode({"t": "session_accept", "sid": decoded["sid"]}))
                 elif decoded.get("t") == "session_start":
                     for index, payload in enumerate(frame_payloads):
                         await ws.send_str(
@@ -72,12 +72,12 @@ async def _run() -> int:
         config = RelayConfig(
             viewer_password="smoke-password",
             agent_key="smoke-agent-key-0123456789",
-            db_path=f"{{tmp}}/relay.db",
+            db_path=f"{tmp}/relay.db",
             heartbeat_timeout=30.0,
         )
         runner = await _boot(config, port)
-        base = f"http://127.0.0.1:{{port}}"
-        base_ws = f"ws://127.0.0.1:{{port}}"
+        base = f"http://127.0.0.1:{port}"
+        base_ws = f"ws://127.0.0.1:{port}"
         ready = asyncio.Event()
         agent_task = asyncio.create_task(_fake_agent(base_ws, config.agent_key, frame_payloads, ready))
         try:
@@ -94,16 +94,16 @@ async def _run() -> int:
                 kind, payload = await asyncio.wait_for(session.receive(), 5)
                 if kind == "bin":
                     frames += 1
-                    await session.send_text({{"t": "frame_recv"}})
+                    await session.send_text({"t": "frame_recv"})
                 elif kind == "closed":
                     break
             await session.close()
             sessions = await client.list_sessions()
             await client.close()
 
-            assert frames == FRAMES, f"expected {{FRAMES}} frames, got {{frames}}"
+            assert frames == FRAMES, f"expected {FRAMES} frames, got {frames}"
             assert sessions and sessions[0]["frames"] >= FRAMES, sessions
-            print(f"smoke ok: frames={{frames}} sessions={{len(sessions)}} log_frames={{sessions[0]['frames']}}")
+            print(f"smoke ok: frames={frames} sessions={len(sessions)} log_frames={sessions[0]['frames']}")
             return 0
         finally:
             agent_task.cancel()
