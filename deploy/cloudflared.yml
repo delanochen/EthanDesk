@@ -1,0 +1,12 @@
+# Cloudflare Tunnel alternative to nginx + Let's Encrypt.
+# Run: cloudflared tunnel --config deploy/cloudflared.yml run deskrelay
+tunnel: deskrelay
+credentials-file: /etc/cloudflared/deskrelay.json
+
+ingress:
+  - hostname: desk.example.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      noTLSVerify: false
+      connectTimeout: 30s
+  - service: http_status:404

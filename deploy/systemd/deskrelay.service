@@ -1,0 +1,18 @@
+[Unit]
+Description=deskrelay remote-desktop relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/deskrelay
+EnvironmentFile=/opt/deskrelay/deskrelay.env
+ExecStart=/opt/deskrelay/.venv/bin/python -m relay.app
+Restart=always
+RestartSec=3
+User=deskrelay
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
