@@ -22,7 +22,7 @@ async def _boot(config: RelayConfig):
 
 
 async def _login(session: ClientSession, base: str, password: str) -> str:
-    response = await session.post(f"{base}/api/login", json={{"password": password}})
+    response = await session.post(f"{base}/api/login", json={"password": password})
     assert response.status == 200
     return (await response.json())["token"]
 
@@ -31,12 +31,12 @@ async def _connect_agent(session: ClientSession, base: str, agent_id: str, key: 
     ws = await session.ws_connect(base.replace("http://", "ws://") + "/ws/agent")
     await ws.send_str(
         json.dumps(
-            {{
+            {
                 "t": "hello",
                 "agent_id": agent_id,
                 "key": key,
-                "info": {{"name": "Office-PC", "host": "office-pc", "os": "Windows", "version": "1.0"}},
-            }}
+                "info": {"name": "Office-PC", "host": "office-pc", "os": "Windows", "version": "1.0"},
+            }
         )
     )
     reply = json.loads(await asyncio.wait_for(ws.receive_str(), WS_TIMEOUT))
@@ -50,7 +50,7 @@ def test_login_rejects_wrong_password(tmp_path):
         runner, base = await _boot(config)
         try:
             async with ClientSession() as session:
-                response = await session.post(f"{base}/api/login", json={{"password": "nope"}})
+                response = await session.post(f"{base}/api/login", json={"password": "nope"})
                 assert response.status == 401
         finally:
             await runner.cleanup()
@@ -81,7 +81,7 @@ def test_agent_registration_and_listing(tmp_path):
                 token = await _login(session, base, "pw")
                 ws = await _connect_agent(session, base, "a1", "ak")
                 response = await session.get(
-                    f"{base}/api/agents", headers={{"Authorization": f"Bearer {{token}}"}}
+                    f"{base}/api/agents", headers={"Authorization": f"Bearer {token}"}
                 )
                 agents = (await response.json())["agents"]
                 assert [agent["id"] for agent in agents] == ["a1"]
@@ -101,7 +101,7 @@ def test_agent_rejects_bad_key(tmp_path):
         try:
             async with ClientSession() as session:
                 ws = await session.ws_connect(base.replace("http://", "ws://") + "/ws/agent")
-                await ws.send_str(json.dumps({{"t": "hello", "agent_id": "a1", "key": "bad"}}))
+                await ws.send_str(json.dumps({"t": "hello", "agent_id": "a1", "key": "bad"}))
                 reply = json.loads(await asyncio.wait_for(ws.receive_str(), WS_TIMEOUT))
                 assert reply["t"] == "error"
                 assert reply["code"] == "bad_agent_key"
@@ -120,13 +120,13 @@ def test_session_bridges_text_and_binary(tmp_path):
                 token = await _login(session, base, "pw")
                 agent_ws = await _connect_agent(session, base, "a1", "ak")
                 viewer = await session.ws_connect(
-                    f"{{base.replace('http://', 'ws://')}}/ws/session?agent_id=a1&token={{token}}"
+                    f"{base.replace('http://', 'ws://')}/ws/session?agent_id=a1&token={token}"
                 )
 
                 request = json.loads(await asyncio.wait_for(agent_ws.receive_str(), WS_TIMEOUT))
                 assert request["t"] == "session_request"
                 assert request["sid"]
-                await agent_ws.send_str(json.dumps({{"t": "session_accept", "sid": request["sid"]}}))
+                await agent_ws.send_str(json.dumps({"t": "session_accept", "sid": request["sid"]}))
 
                 accepted = json.loads(await asyncio.wait_for(viewer.receive_str(), WS_TIMEOUT))
                 assert accepted["t"] == "session_accept"
@@ -134,12 +134,12 @@ def test_session_bridges_text_and_binary(tmp_path):
                 start = json.loads(await asyncio.wait_for(agent_ws.receive_str(), WS_TIMEOUT))
                 assert start["t"] == "session_start"
 
-                await viewer.send_str(json.dumps({{"t": "input", "ev": "mouse_move", "x": 0.5, "y": 0.5}}))
+                await viewer.send_str(json.dumps({"t": "input", "ev": "mouse_move", "x": 0.5, "y": 0.5}))
                 forwarded = json.loads(await asyncio.wait_for(agent_ws.receive_str(), WS_TIMEOUT))
                 assert forwarded["t"] == "input"
                 assert forwarded["ev"] == "mouse_move"
 
-                await agent_ws.send_str(json.dumps({{"t": "bin", "kind": "frame", "seq": 1, "size": 3}}))
+                await agent_ws.send_str(json.dumps({"t": "bin", "kind": "frame", "seq": 1, "size": 3}))
                 await agent_ws.send_bytes(b"abc")
                 header = json.loads(await asyncio.wait_for(viewer.receive_str(), WS_TIMEOUT))
                 assert header["t"] == "bin"
@@ -166,10 +166,10 @@ def test_session_denied_by_agent(tmp_path):
                 token = await _login(session, base, "pw")
                 agent_ws = await _connect_agent(session, base, "a1", "ak")
                 viewer = await session.ws_connect(
-                    f"{{base.replace('http://', 'ws://')}}/ws/session?agent_id=a1&token={{token}}"
+                    f"{base.replace('http://', 'ws://')}/ws/session?agent_id=a1&token={token}"
                 )
                 request = json.loads(await asyncio.wait_for(agent_ws.receive_str(), WS_TIMEOUT))
-                await agent_ws.send_str(json.dumps({{"t": "session_denied", "sid": request["sid"]}}))
+                await agent_ws.send_str(json.dumps({"t": "session_denied", "sid": request["sid"]}))
                 reply = json.loads(await asyncio.wait_for(viewer.receive_str(), WS_TIMEOUT))
                 assert reply["t"] == "error"
                 assert reply["code"] == "session_denied"
@@ -189,7 +189,7 @@ def test_session_reports_offline_agent(tmp_path):
             async with ClientSession() as session:
                 token = await _login(session, base, "pw")
                 viewer = await session.ws_connect(
-                    f"{{base.replace('http://', 'ws://')}}/ws/session?agent_id=ghost&token={{token}}"
+                    f"{base.replace('http://', 'ws://')}/ws/session?agent_id=ghost&token={token}"
                 )
                 reply = json.loads(await asyncio.wait_for(viewer.receive_str(), WS_TIMEOUT))
                 assert reply["t"] == "error"
@@ -209,7 +209,7 @@ def test_session_rejects_bad_token(tmp_path):
             async with ClientSession() as session:
                 with pytest.raises(WSServerHandshakeError):
                     await session.ws_connect(
-                        f"{{base.replace('http://', 'ws://')}}/ws/session?agent_id=a1&token=tampered"
+                        f"{base.replace('http://', 'ws://')}/ws/session?agent_id=a1&token=tampered"
                     )
         finally:
             await runner.cleanup()
@@ -226,12 +226,12 @@ def test_session_log_persists_on_close(tmp_path):
                 token = await _login(session, base, "pw")
                 agent_ws = await _connect_agent(session, base, "a1", "ak")
                 viewer = await session.ws_connect(
-                    f"{{base.replace('http://', 'ws://')}}/ws/session?agent_id=a1&token={{token}}"
+                    f"{base.replace('http://', 'ws://')}/ws/session?agent_id=a1&token={token}"
                 )
                 request = json.loads(await asyncio.wait_for(agent_ws.receive_str(), WS_TIMEOUT))
-                await agent_ws.send_str(json.dumps({{"t": "session_accept", "sid": request["sid"]}}))
+                await agent_ws.send_str(json.dumps({"t": "session_accept", "sid": request["sid"]}))
                 await asyncio.wait_for(viewer.receive_str(), WS_TIMEOUT)
-                await agent_ws.send_str(json.dumps({{"t": "bin", "kind": "frame", "seq": 1, "size": 3}}))
+                await agent_ws.send_str(json.dumps({"t": "bin", "kind": "frame", "seq": 1, "size": 3}))
                 await agent_ws.send_bytes(b"abc")
                 await asyncio.wait_for(viewer.receive(), WS_TIMEOUT)
                 await viewer.close()
@@ -239,7 +239,7 @@ def test_session_log_persists_on_close(tmp_path):
 
                 rows = await (
                     await session.get(
-                        f"{{base}}/api/sessions", headers={{"Authorization": f"Bearer {{token}}"}}
+                        f"{base}/api/sessions", headers={"Authorization": f"Bearer {token}"}
                     )
                 ).json()
                 sessions = rows["sessions"]
