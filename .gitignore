@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# runtime state
+*.db
+*.db-journal
+*.log
+deskrelay.env
+
+# local editor
+.vscode/
+.idea/
