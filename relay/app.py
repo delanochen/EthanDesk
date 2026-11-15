@@ -275,7 +275,11 @@ async def handle_viewer_ws(request: web.Request) -> web.WebSocketResponse:
     future: asyncio.Future = asyncio.get_running_loop().create_future()
     link.start_session(ws, viewer_name, session_id, future)
 
-    if not await _send(link.ws, {"t": "session_request", "sid": session_id, "viewer": viewer_name}):
+    code = request.query.get("code", "")
+    if not await _send(
+        link.ws,
+        {"t": "session_request", "sid": session_id, "viewer": viewer_name, "code": code},
+    ):
         link.detach()
         await _send(ws, {"t": "error", "code": "agent_offline", "agent_id": agent_id})
         await ws.close()

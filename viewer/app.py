@@ -18,12 +18,63 @@ from typing import Any
 from agent.files_transfer import FileTransferError, IncomingFile, OutgoingFile
 from common.coords import canvas_to_frame_norm, letterbox_fit
 from common.protocol import BinaryPairer, encode, make_bin_header
+from common.defaults import DEFAULT_VIEWER_URL
 from viewer.client import DeskClient, DeskClientError, Session
+from viewer.config import ViewerConfig
 
 COMMAND_POLL = 0.01
 AGENT_REFRESH = 5.0
 CLIPBOARD_POLL = 0.6
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "deskrelay")
+
+# Adaptive picture control (自适应画质). A link that cannot move the user's profile has to
+# trade sharpness for frame rate, otherwise the picture is unusable even though nothing is
+# broken. The low and high thresholds are deliberately far apart: a marginal link sits
+# between them and must not oscillate on every window.
+ADAPT_WINDOW = 4.0
+ADAPT_MIN_SCALE = 0.5
+ADAPT_MIN_QUALITY = 35
+ADAPT_MAX_QUALITY = 85
+ADAPT_LOW_FPS = 3.0
+ADAPT_HIGH_FPS = 14.0
+ADAPT_QUALITY_STEP = 10
+ADAPT_SCALE_STEP = 0.05
+
+
+def next_video_profile(
+    fps: float,
+    scale: float,
+    quality: int,
+    base_scale: float,
+    base_quality: int,
+) -> "tuple[float, int]":
+    """Return the (scale, quality) for the next window given what the link just managed.
+
+    Quality is spent first - at a fixed frame size it is the cheapest knob in bytes per
+    unit of clarity - and resolution only after quality is at the floor. Recovery climbs
+    resolution back before quality, so a recovering link regains readability first.
+    The user's own profile (``base_*``) is the ceiling: adaptation never makes the picture
+    better than what was asked for.
+    """
+    floor_quality = min(ADAPT_MIN_QUALITY, int(base_quality))
+    ceiling_quality = min(ADAPT_MAX_QUALITY, int(base_quality))
+    floor_scale = min(ADAPT_MIN_SCALE, float(base_scale))
+    ceiling_scale = float(base_scale)
+
+    scale = max(floor_scale, min(ceiling_scale, float(scale)))
+    quality = max(floor_quality, min(ceiling_quality, int(quality)))
+
+    if fps <= 0 or fps < ADAPT_LOW_FPS:
+        if quality > floor_quality:
+            quality = max(floor_quality, quality - ADAPT_QUALITY_STEP)
+        elif scale > floor_scale:
+            scale = max(floor_scale, round(scale - ADAPT_SCALE_STEP, 3))
+    elif fps >= ADAPT_HIGH_FPS:
+        if scale < ceiling_scale:
+            scale = min(ceiling_scale, round(scale + ADAPT_SCALE_STEP, 3))
+        elif quality < ceiling_quality:
+            quality = min(ceiling_quality, quality + ADAPT_QUALITY_STEP)
+    return round(scale, 3), quality
 
 
 class ViewerWorker:
@@ -41,6 +92,15 @@ class ViewerWorker:
         self._clip_enabled = False
         self._connected_agent = ""
         self.download_dir = DEFAULT_DOWNLOAD_DIR
+        # Picture profile: base is what the user asked for, effective is what is in force
+        # right now (adaptation only ever lowers it, and only while auto_quality is on).
+        self._auto_quality = bool(ViewerConfig.load().auto_quality)
+        self._base_quality = 70
+        self._base_scale = 1.0
+        self._base_fps = 15
+        self._eff_quality = self._base_quality
+        self._eff_scale = self._base_scale
+        self._frame_times: "list[float]" = []
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -65,6 +125,7 @@ class ViewerWorker:
         self._loop = asyncio.get_running_loop()
         refresh_task = asyncio.create_task(self._refresh_loop())
         clip_task = asyncio.create_task(self._clipboard_loop())
+        adapt_task = asyncio.create_task(self._adapt_loop())
         try:
             while not self._stopping:
                 command = None
@@ -77,6 +138,7 @@ class ViewerWorker:
         finally:
             refresh_task.cancel()
             clip_task.cancel()
+            adapt_task.cancel()
             await self._teardown()
 
     async def _dispatch(self, command: tuple[str, Any]) -> None:
@@ -96,10 +158,18 @@ class ViewerWorker:
                 await self._session.send_text(payload)
             elif action == "frame_recv" and self._session is not None:
                 await self._session.send_text({"t": "frame_recv"})
-            elif action == "settings" and self._session is not None:
-                await self._session.send_text({"t": "set_quality", **payload})
+            elif action == "settings":
+                self._remember_base(payload)
+                if self._session is not None:
+                    await self._session.send_text({"t": "set_quality", **self._effective_payload()})
+            elif action == "auto_quality":
+                self._set_auto_quality(bool(payload))
+                if self._session is not None:
+                    await self._session.send_text({"t": "set_quality", **self._effective_payload()})
+                self._emit("auto_quality", self._auto_quality)
             elif action == "upload" and self._session is not None:
-                await self._upload(str(payload))
+                path = payload.get("path", "") if isinstance(payload, dict) else payload
+                await self._upload(str(path))
             elif action == "clip" and self._session is not None:
                 await self._session.send_text({"t": "clip", "dir": "to_agent", "text": str(payload)})
             elif action == "set_clipboard_sync":
@@ -110,6 +180,58 @@ class ViewerWorker:
             self._emit("error", str(exc))
         except Exception as exc:  # surface unexpected faults instead of dying silently
             self._emit("error", f"内部错误：{exc!r}")
+
+    # ------------------------------------------------------------- picture profile
+    def _remember_base(self, payload: dict) -> None:
+        """Take the user's own picture profile, and restart adaptation from it."""
+        try:
+            self._base_quality = int(payload.get("quality", self._base_quality))
+            self._base_scale = float(payload.get("scale", self._base_scale))
+            self._base_fps = int(payload.get("fps", self._base_fps))
+        except (TypeError, ValueError, AttributeError):
+            return
+        self._eff_quality = self._base_quality
+        self._eff_scale = self._base_scale
+
+    def _effective_payload(self) -> dict:
+        return {"scale": self._eff_scale, "quality": self._eff_quality, "fps": self._base_fps}
+
+    def _set_auto_quality(self, enabled: bool) -> None:
+        self._auto_quality = bool(enabled)
+        if not self._auto_quality:
+            self._eff_quality = self._base_quality
+            self._eff_scale = self._base_scale
+            self._frame_times = []
+
+    def _frame_tick(self) -> None:
+        now = time.time()
+        self._frame_times.append(now)
+        cutoff = now - ADAPT_WINDOW
+        if self._frame_times and self._frame_times[0] < cutoff:
+            self._frame_times = [stamp for stamp in self._frame_times if stamp >= cutoff]
+
+    async def _adapt_loop(self) -> None:
+        """On every window, lower the picture if the link is too slow and climb back when it is not."""
+        try:
+            while True:
+                await asyncio.sleep(ADAPT_WINDOW)
+                session = self._session
+                if not self._auto_quality or session is None:
+                    self._frame_times = []
+                    continue
+                now = time.time()
+                self._frame_times = [stamp for stamp in self._frame_times if stamp >= now - ADAPT_WINDOW]
+                fps = len(self._frame_times) / ADAPT_WINDOW
+                scale, quality = next_video_profile(
+                    fps, self._eff_scale, self._eff_quality, self._base_scale, self._base_quality
+                )
+                if (scale, quality) == (self._eff_scale, self._eff_quality):
+                    continue
+                self._eff_scale, self._eff_quality = scale, quality
+                await session.send_text({"t": "set_quality", **self._effective_payload()})
+                self._emit("auto_profile", {"fps": fps, "scale": scale, "quality": quality})
+        except asyncio.CancelledError:
+            pass
 
     # ---------------------------------------------------------------- client
     async def _login(self, url: str, password: str) -> None:
@@ -144,13 +266,21 @@ class ViewerWorker:
         except asyncio.CancelledError:
             pass
 
-    async def _connect(self, agent_id: str) -> None:
+    async def _connect(self, payload) -> None:
         if self._client is None:
             self._emit("error", "请先登录")
             return
+        if isinstance(payload, dict):
+            agent_id = str(payload.get("agent_id", ""))
+            code = str(payload.get("code", ""))
+        else:
+            agent_id, code = str(payload), ""
+        if not agent_id:
+            self._emit("error", "缺少设备 ID")
+            return
         await self._teardown()
         self._emit("status", f"正在连接 {agent_id}…")
-        session = await self._client.open_session(agent_id)
+        session = await self._client.open_session(agent_id, code)
         self._session = session
         self._pairer = BinaryPairer()
         self._incoming = {}
@@ -314,8 +444,12 @@ class ViewerWindow:
         self.root.geometry("1180x760")
         self.root.minsize(900, 600)
 
-        self.url_var = tk.StringVar(value="https://desk.example.com")
-        self.password_var = tk.StringVar()
+        self.settings = ViewerConfig.load()
+        self.url_var = tk.StringVar(value=self.settings.relay_url)
+        self.password_var = tk.StringVar(value=self.settings.password)
+        self.auto_var = tk.BooleanVar(value=bool(self.settings.auto_quality))
+        self.adaptive_note = tk.StringVar(value="")
+        self.code_var = tk.StringVar()
         self.quality_var = tk.IntVar(value=70)
         self.scale_var = tk.DoubleVar(value=1.0)
         self.fps_var = tk.IntVar(value=15)
@@ -332,69 +466,147 @@ class ViewerWindow:
     def _build_layout(self) -> None:
         from tkinter import ttk
 
+        from ui.theme import PALETTE, VIEWER_PAGES, apply_theme
+
         tk = self._tk
-        outer = ttk.Frame(self.root, padding=8)
-        outer.pack(fill="both", expand=True)
+        apply_theme(self.root)
+        self.root.configure(background=PALETTE["bg"])
 
-        login = ttk.LabelFrame(outer, text="登录中继", padding=8)
-        login.pack(fill="x")
-        ttk.Label(login, text="中继地址").grid(row=0, column=0, sticky="w")
-        ttk.Entry(login, textvariable=self.url_var, width=34).grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(login, text="口令").grid(row=0, column=2, sticky="w")
-        ttk.Entry(login, textvariable=self.password_var, show="*", width=18).grid(
-            row=0, column=3, sticky="w", padx=6
-        )
-        ttk.Button(login, text="登录", command=self._login).grid(row=0, column=4, padx=4)
-        ttk.Label(login, textvariable=self.login_info, foreground="#555").grid(
-            row=1, column=0, columnspan=5, sticky="w", pady=(6, 0)
-        )
+        shell = ttk.Frame(self.root)
+        shell.pack(fill="both", expand=True)
 
-        body = ttk.Panedwindow(outer, orient="horizontal")
-        body.pack(fill="both", expand=True, pady=8)
+        side = ttk.Frame(shell, style="Sidebar.TFrame", width=188)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        ttk.Label(side, text="EthanDesk", style="Sidebar.TLabel",
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w", padx=18, pady=(20, 0))
+        ttk.Label(side, text="主控端 · Free", style="SidebarMuted.TLabel").pack(anchor="w", padx=18, pady=(2, 22))
 
-        left = ttk.Frame(body, width=280)
-        body.add(left, weight=0)
-        ttk.Label(left, text="在线设备").pack(anchor="w")
-        self.tree = ttk.Treeview(
-            left, columns=("name", "host", "status"), show="headings", height=16, selectmode="browse"
-        )
-        self.tree.heading("name", text="名称")
-        self.tree.heading("host", text="主机")
-        self.tree.heading("status", text="状态")
-        self.tree.column("name", width=120)
-        self.tree.column("host", width=110)
-        self.tree.column("status", width=60)
-        self.tree.pack(fill="both", expand=True, pady=4)
+        self._nav_buttons = {}
+        for name in VIEWER_PAGES:
+            button = ttk.Button(side, text=name, style="Nav.TButton",
+                                command=lambda n=name: self._show_page(n))
+            button.pack(fill="x", padx=8, pady=1)
+            self._nav_buttons[name] = button
+
+        foot = ttk.Frame(side, style="Sidebar.TFrame")
+        foot.pack(side="bottom", fill="x", padx=18, pady=16)
+        ttk.Label(foot, textvariable=self.status_var, style="SidebarMuted.TLabel",
+                  wraplength=150, justify="left").pack(anchor="w")
+
+        main = ttk.Frame(shell)
+        main.pack(side="left", fill="both", expand=True)
+
+        top = ttk.Frame(main)
+        top.pack(fill="x", padx=22, pady=(16, 4))
+        self.search_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.search_var, width=44).pack(side="left")
+        ttk.Button(top, text="登录中继", style="Accent.TButton", command=self._login).pack(side="right")
+        ttk.Label(top, textvariable=self.login_info, style="Muted.TLabel").pack(side="right", padx=12)
+
+        body = ttk.Frame(main)
+        body.pack(fill="both", expand=True, padx=22, pady=(4, 18))
+
+        self.pages = {}
+        self.pages["远程协助"] = self._page_assist(body)
+        self.pages["设备"] = self._page_devices(body)
+        self.pages["会话"] = self._page_session(body)
+        self.pages["设置"] = self._page_settings(body)
+        self._show_page("远程协助")
+
+    # ------------------------------------------------------------- page router
+    def _show_page(self, name: str) -> None:
+        pages = getattr(self, "pages", {})
+        if not pages:
+            return
+        for key, frame in pages.items():
+            if key == name:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
+        for key, button in getattr(self, "_nav_buttons", {}).items():
+            button.configure(style="NavOn.TButton" if key == name else "Nav.TButton")
+        self.active_page = name
+        if name == "设备":
+            self._refresh_cards()
+        if name == "会话":
+            self.canvas.focus_set()
+
+    def _page_assist(self, parent):
+        from tkinter import ttk
+
+        page = ttk.Frame(parent)
+        ttk.Label(page, text="远程协助", style="H1.TLabel").pack(anchor="w", pady=(4, 2))
+        ttk.Label(page, text="输入伙伴识别码与验证码发起协助，或直接选中下方在线设备",
+                  style="Muted.TLabel").pack(anchor="w")
+
+        row = ttk.Frame(page)
+        row.pack(fill="x", pady=(16, 10))
+        self.target_var = self._tk.StringVar()
+        ttk.Entry(row, textvariable=self.target_var, width=26).pack(side="left")
+        ttk.Label(row, text="验证码", style="Muted.TLabel").pack(side="left", padx=(12, 6))
+        ttk.Entry(row, textvariable=self.code_var, width=14).pack(side="left")
+        ttk.Button(row, text="连接", style="Accent.TButton", width=12,
+                   command=self._connect_target).pack(side="left", padx=12)
+
+        ttk.Separator(page).pack(fill="x", pady=(8, 12))
+        ttk.Label(page, text="在线设备", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        self.tree = ttk.Treeview(page, columns=("name", "host", "status"), show="headings",
+                                 height=10, selectmode="browse")
+        for column, label, width in (("name", "名称", 200), ("host", "主机", 220), ("status", "状态", 90)):
+            self.tree.heading(column, text=label)
+            self.tree.column(column, width=width)
+        self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda _event: self._connect_selected())
 
-        buttons = ttk.Frame(left)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="刷新", command=lambda: self.commands.put(("refresh_agents", None))).pack(
-            side="left"
-        )
-        ttk.Button(buttons, text="连接", command=self._connect_selected).pack(side="left", padx=6)
-        ttk.Button(buttons, text="断开", command=self._disconnect).pack(side="left")
+        bar = ttk.Frame(page)
+        bar.pack(fill="x", pady=(10, 0))
+        ttk.Button(bar, text="刷新", command=lambda: self.commands.put(("refresh_agents", None))).pack(side="left")
+        ttk.Button(bar, text="连接选中", style="Accent.TButton",
+                   command=self._connect_selected).pack(side="left", padx=8)
+        ttk.Button(bar, text="断开", command=self._disconnect).pack(side="left")
+        return page
 
-        right = ttk.Frame(body)
-        body.add(right, weight=1)
+    def _page_devices(self, parent):
+        from tkinter import ttk
 
-        tools = ttk.Frame(right)
-        tools.pack(fill="x")
-        ttk.Label(tools, text="画质").pack(side="left")
-        ttk.Scale(tools, from_=20, to=95, variable=self.quality_var, orient="horizontal", length=110,
-                  command=lambda _e: self._send_settings()).pack(side="left", padx=4)
-        ttk.Label(tools, text="缩放").pack(side="left")
-        ttk.Scale(tools, from_=0.25, to=1.0, variable=self.scale_var, orient="horizontal", length=110,
-                  command=lambda _e: self._send_settings()).pack(side="left", padx=4)
-        ttk.Label(tools, text="帧率").pack(side="left")
-        ttk.Spinbox(tools, from_=1, to=30, textvariable=self.fps_var, width=4,
-                    command=self._send_settings).pack(side="left", padx=4)
-        ttk.Checkbutton(tools, text="剪贴板同步", variable=self.clip_var,
-                        command=self._toggle_clipboard).pack(side="left", padx=8)
-        ttk.Button(tools, text="上传文件…", command=self._pick_upload).pack(side="left", padx=4)
+        page = ttk.Frame(parent)
+        ttk.Label(page, text="设备", style="H1.TLabel").pack(anchor="w", pady=(4, 2))
+        ttk.Label(page, text="登录中继后，在线设备以卡片形式出现", style="Muted.TLabel").pack(anchor="w")
+        self.cards = ttk.Frame(page)
+        self.cards.pack(fill="both", expand=True, pady=(12, 8))
 
-        self.canvas = tk.Canvas(right, background="#1c1c1c", highlightthickness=0, takefocus=1)
-        self.canvas.pack(fill="both", expand=True, pady=6)
+        ttk.Label(page, text="会话记录", style="Section.TLabel").pack(anchor="w", pady=(4, 6))
+        self.history = ttk.Treeview(page, columns=("agent", "viewer", "start", "duration", "frames"),
+                                    show="headings", height=5)
+        for column, label, width in (
+            ("agent", "设备", 160),
+            ("viewer", "操作人", 110),
+            ("start", "开始时间", 170),
+            ("duration", "时长(秒)", 90),
+            ("frames", "帧数", 80),
+        ):
+            self.history.heading(column, text=label)
+            self.history.column(column, width=width)
+        self.history.pack(fill="x")
+        bar = ttk.Frame(page)
+        bar.pack(fill="x", pady=(6, 0))
+        ttk.Button(bar, text="刷新记录",
+                   command=lambda: self.commands.put(("refresh_sessions", None))).pack(side="left")
+        return page
+
+    def _page_session(self, parent):
+        from tkinter import ttk
+
+        tk = self._tk
+        page = ttk.Frame(parent)
+        head = ttk.Frame(page)
+        head.pack(fill="x")
+        ttk.Label(head, text="会话", style="H1.TLabel").pack(side="left")
+        ttk.Label(head, textvariable=self.metric_var, style="Muted.TLabel").pack(side="right")
+
+        self.canvas = tk.Canvas(page, background="#0B0C0E", highlightthickness=0, takefocus=1)
+        self.canvas.pack(fill="both", expand=True, pady=10)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<ButtonPress-1>", lambda _e: self._send_button("left", True))
         self.canvas.bind("<ButtonRelease-1>", lambda _e: self._send_button("left", False))
@@ -409,38 +621,186 @@ class ViewerWindow:
         self.canvas.bind("<KeyRelease>", lambda event: self._on_key(event, False))
         self.canvas.bind("<Configure>", lambda _event: self._redraw())
 
-        status = ttk.Frame(right)
-        status.pack(fill="x")
-        ttk.Label(status, textvariable=self.status_var).pack(side="left")
-        ttk.Label(status, textvariable=self.metric_var, foreground="#555").pack(side="right")
+        bar = ttk.Frame(page)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="断开", command=self._disconnect).pack(side="left")
+        ttk.Button(bar, text="上传文件…", command=self._pick_upload).pack(side="left", padx=8)
+        ttk.Checkbutton(bar, text="剪贴板同步", variable=self.clip_var,
+                        command=self._toggle_clipboard).pack(side="left", padx=12)
+        ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
+        return page
 
-        history = ttk.LabelFrame(outer, text="会话记录", padding=6)
-        history.pack(fill="x")
-        self.history = ttk.Treeview(
-            history, columns=("agent", "viewer", "start", "duration", "frames"), show="headings", height=4
+    def _page_settings(self, parent):
+        from tkinter import ttk
+
+        page = ttk.Frame(parent)
+        ttk.Label(page, text="设置", style="H1.TLabel").pack(anchor="w", pady=(4, 10))
+        split = ttk.Frame(page)
+        split.pack(fill="both", expand=True)
+
+        sub = ttk.Frame(split, width=140)
+        sub.pack(side="left", fill="y")
+        sub.pack_propagate(False)
+        right = ttk.Frame(split)
+        right.pack(side="left", fill="both", expand=True, padx=(18, 0))
+
+        self._settings_panels = {}
+        self._settings_buttons = {}
+        panels = {
+            "本机信息": self._panel_about(right),
+            "网络": self._panel_network(right),
+            "画面": self._panel_picture(right),
+        }
+        self._settings_panels = panels
+        for name in panels:
+            button = ttk.Button(sub, text=name, style="SubNav.TButton",
+                                command=lambda n=name: self._show_settings_panel(n))
+            button.pack(fill="x", pady=1)
+            self._settings_buttons[name] = button
+        self._show_settings_panel("网络")
+        return page
+
+    def _show_settings_panel(self, name: str) -> None:
+        for key, frame in getattr(self, "_settings_panels", {}).items():
+            if key == name:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
+        for key, button in getattr(self, "_settings_buttons", {}).items():
+            button.configure(style="SubNavOn.TButton" if key == name else "SubNav.TButton")
+
+    def _panel_about(self, parent):
+        from tkinter import ttk
+
+        import socket
+
+        frame = ttk.Frame(parent)
+        rows = (
+            ("设备名", socket.gethostname()),
+            ("角色", "主控端"),
+            ("版本", "1.0.1"),
         )
-        for column, label, width in (
-            ("agent", "设备", 120),
-            ("viewer", "操作人", 90),
-            ("start", "开始时间", 150),
-            ("duration", "时长(秒)", 80),
-            ("frames", "帧数", 70),
-        ):
-            self.history.heading(column, text=label)
-            self.history.column(column, width=width)
-        self.history.pack(fill="x")
-        history_buttons = ttk.Frame(history)
-        history_buttons.pack(fill="x", pady=(4, 0))
-        ttk.Button(history_buttons, text="刷新记录",
-                   command=lambda: self.commands.put(("refresh_sessions", None))).pack(side="left")
+        for index, (label, value) in enumerate(rows):
+            ttk.Label(frame, text=label, style="Muted.TLabel").grid(row=index, column=0, sticky="w", pady=6)
+            ttk.Label(frame, text=value).grid(row=index, column=1, sticky="w", padx=18, pady=6)
+        ttk.Label(frame, text="中继地址", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Label(frame, textvariable=self.url_var).grid(row=3, column=1, sticky="w", padx=18, pady=6)
+        ttk.Label(frame, text="登录状态", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Label(frame, textvariable=self.login_info).grid(row=4, column=1, sticky="w", padx=18, pady=6)
+        return frame
+
+    def _panel_network(self, parent):
+        from tkinter import ttk
+
+        from common.defaults import DEFAULT_VIEWER_URL
+
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text="中继地址", style="Muted.TLabel").pack(anchor="w")
+        ttk.Entry(frame, textvariable=self.url_var, width=46).pack(anchor="w", pady=(2, 2))
+        ttk.Label(frame, text=f"默认：{DEFAULT_VIEWER_URL}", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(frame, text="登录口令", style="Muted.TLabel").pack(anchor="w", pady=(14, 0))
+        ttk.Entry(frame, textvariable=self.password_var, show="*", width=28).pack(anchor="w", pady=(2, 0))
+
+        bar = ttk.Frame(frame)
+        bar.pack(anchor="w", pady=(16, 0))
+
+        def restore_default() -> None:
+            self.url_var.set(DEFAULT_VIEWER_URL)
+
+        ttk.Button(bar, text="恢复默认", command=restore_default).pack(side="left")
+        ttk.Button(bar, text="保存并登录", style="Accent.TButton", command=self._login).pack(side="left", padx=8)
+        return frame
+
+    def _panel_picture(self, parent):
+        from tkinter import ttk
+
+        frame = ttk.Frame(parent)
+        for label, widget in (("画质", "quality"), ("缩放", "scale"), ("帧率", "fps")):
+            ttk.Label(frame, text=label, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
+            if widget == "quality":
+                ttk.Scale(frame, from_=20, to=95, variable=self.quality_var, orient="horizontal",
+                          length=220, command=lambda _e: self._send_settings()).pack(anchor="w")
+            elif widget == "scale":
+                ttk.Scale(frame, from_=0.25, to=1.0, variable=self.scale_var, orient="horizontal",
+                          length=220, command=lambda _e: self._send_settings()).pack(anchor="w")
+            else:
+                ttk.Spinbox(frame, from_=1, to=30, textvariable=self.fps_var, width=6,
+                            command=self._send_settings).pack(anchor="w")
+        ttk.Checkbutton(frame, text="自适应画质（慢链路自动降低清晰度保帧率）",
+                        variable=self.auto_var,
+                        command=self._toggle_auto).pack(anchor="w", pady=(12, 0))
+        ttk.Label(frame, textvariable=self.adaptive_note, style="Muted.TLabel").pack(anchor="w")
+        return frame
+
+    def _toggle_auto(self) -> None:
+        enabled = bool(self.auto_var.get())
+        self.settings.auto_quality = enabled
+        self._save_settings()
+        self.commands.put(("auto_quality", enabled))
+        if not enabled:
+            self.adaptive_note.set("")
 
     # ---------------------------------------------------------------- actions
+    def _connect_target(self) -> None:
+        agent_id = self.target_var.get().strip()
+        if not agent_id:
+            self._connect_selected()
+            return
+        self.commands.put(("connect", {"agent_id": agent_id, "code": self.code_var.get().strip()}))
+        self.status_var.set(f"正在连接 {agent_id}…")
+        self._show_page("会话")
+
+    def _connect_item(self, item: str) -> None:
+        try:
+            self.tree.selection_set(item)
+        except Exception:
+            pass
+        self._connect_selected()
+        self._show_page("会话")
+
+    def _refresh_cards(self) -> None:
+        from tkinter import ttk
+
+        cards = getattr(self, "cards", None)
+        tree = getattr(self, "tree", None)
+        if cards is None or tree is None:
+            return
+        for child in cards.winfo_children():
+            child.destroy()
+        rows = list(tree.get_children())
+        if not rows:
+            ttk.Label(cards, text="暂无在线设备", style="Muted.TLabel").pack(anchor="w", pady=10)
+            return
+        columns = 3
+        for index, item in enumerate(rows):
+            values = tree.item(item, "values")
+            name = values[0] if values else item
+            host = values[1] if len(values) > 1 else ""
+            card = ttk.Frame(cards, style="Card.TFrame", padding=14)
+            card.grid(row=index // columns, column=index % columns, sticky="nsew", padx=6, pady=6)
+            ttk.Label(card, text=str(name), style="Panel.TLabel",
+                      font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
+            ttk.Label(card, text=str(host), style="PanelMuted.TLabel").pack(anchor="w", pady=(2, 12))
+            actions = ttk.Frame(card, style="Card.TFrame")
+            actions.pack(anchor="w")
+            ttk.Button(actions, text="桌面控制", style="Accent.TButton",
+                       command=lambda i=item: self._connect_item(i)).pack(side="left")
+            ttk.Button(actions, text="桌面观看",
+                       command=lambda i=item: self._connect_item(i)).pack(side="left", padx=6)
+        for column in range(columns):
+            cards.grid_columnconfigure(column, weight=1)
+
+
     def _login(self) -> None:
-        url = self.url_var.get().strip()
+        url = self.url_var.get().strip() or DEFAULT_VIEWER_URL
         password = self.password_var.get()
+        self.settings.relay_url = url
+        self.settings.password = password
+        self._save_settings()
         if not url:
             self._messagebox.showerror("缺少地址", "请填写中继地址")
             return
+        self.url_var.set(url)
         self.status_var.set("正在登录…")
         self.commands.put(("login", {"url": url, "password": password}))
 
@@ -450,8 +810,14 @@ class ViewerWindow:
             self._messagebox.showinfo("未选择设备", "请先在左侧选择一个在线设备")
             return
         agent_id = selection[0]
-        self.commands.put(("connect", agent_id))
+        self.commands.put(("connect", {"agent_id": agent_id, "code": self.code_var.get().strip()}))
         self.status_var.set("等待被控端确认…")
+
+    def _save_settings(self) -> None:
+        try:
+            self.settings.save()
+        except OSError as exc:
+            self._messagebox.showwarning("保存失败", f"无法写入配置文件：{exc}")
 
     def _disconnect(self) -> None:
         self.commands.put(("disconnect", None))
@@ -602,6 +968,15 @@ class ViewerWindow:
             elif kind == "meta":
                 self.status_var.set(f"已连接 · {payload.get('width')}×{payload.get('height')}")
                 self._send_settings()
+                if self.auto_var.get():
+                    self.commands.put(("auto_quality", True))
+            elif kind == "auto_profile":
+                fps = float(payload.get("fps", 0.0) or 0.0)
+                self.adaptive_note.set(
+                    f"自适应中：{payload.get('scale')}× / q{payload.get('quality')}（{fps:.1f} fps）"
+                )
+            elif kind == "auto_quality":
+                self.adaptive_note.set("自适应画质已开启，等待链路测量…" if payload else "")
             elif kind == "clip":
                 self.last_clip_text = str(payload)
                 self._write_clipboard(str(payload))

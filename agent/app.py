@@ -22,12 +22,24 @@ import aiohttp
 from agent import clip, inject, screen
 from agent.config import AgentConfig
 from agent.files_transfer import FileTransferError, IncomingFile, OutgoingFile
+from common import session_code
 from common.protocol import BinaryPairer, ProtocolError, decode, encode, make_bin_header
+from common.session_code import POLICY_DAILY, POLICY_EVERY_SESSION, POLICY_NEVER
+
+POLICY_LABELS = {
+    POLICY_EVERY_SESSION: "每次被控后",
+    POLICY_DAILY: "每日",
+    POLICY_NEVER: "永不",
+}
+POLICY_BY_LABEL = {label: policy for policy, label in POLICY_LABELS.items()}
 
 CONSENT_TIMEOUT = 30.0
 CLIPBOARD_POLL = 0.6
 PING_INTERVAL = 20.0
 RECONNECT_DELAY = 3.0
+# 允许同时在途的未确认帧数，以及应答丢失后的自愈阈值（秒）
+MAX_INFLIGHT = 3
+ACK_TIMEOUT = 2.0
 
 
 class AgentWorker:
@@ -48,11 +60,18 @@ class AgentWorker:
         self._scale = config.scale
         self._fps = config.fps
         self._inflight = 0
+        self._inflight_since = 0.0
         self._active_session: str | None = None
         self._capture_task: asyncio.Task | None = None
         self._consent: dict[str, asyncio.Future] = {}
         self._incoming: dict[str, IncomingFile] = {}
         self._last_clip_signature = ""
+        # Diagnostics for the control path: 鼠标/键盘到底有没有到、换算成了哪个像素。
+        # 关着的时候一行都不打，开的时候每类事件最多 1 秒一条。
+        self._debug_input = bool(os.environ.get("ETHANDESK_DEBUG_INPUT"))
+        self._last_input_log = 0.0
+        self._last_capture_error = ""
+        self._first_frame_logged = False
         self._connected = False
         self._ws: aiohttp.ClientWebSocketResponse | None = None
 
@@ -226,14 +245,27 @@ class AgentWorker:
             return
         if kind == "session_close":
             self._stop_capture()
+            if self.config.session_code_policy == POLICY_EVERY_SESSION:
+                self.config.rotate_session_code()
+                self._save_config()
+                self._emit("log", f"验证码已更新：{self.config.session_code}")
             self._emit("log", "远控会话已结束")
             return
         if kind == "input":
             if self._allow_input and self._active_session:
                 try:
-                    inject.apply_input(message, self._capturer.bounds if self._capturer else None)
+                    applied = inject.apply_input(
+                        message, self._capturer.bounds if self._capturer else None
+                    )
+                    self._note_input(message, applied)
                 except inject.InputInjectionError as exc:
                     self._emit("log", f"输入注入失败：{exc}")
+            elif self._debug_input:
+                self._emit(
+                    "log",
+                    f"输入被忽略（allow_input={self._allow_input} "
+                    f"session={bool(self._active_session)}）：{message.get('ev')}",
+                )
             return
         if kind == "set_quality":
             self.apply_settings(
@@ -243,7 +275,8 @@ class AgentWorker:
             )
             return
         if kind == "frame_recv":
-            self._inflight = 0
+            self._inflight = max(0, self._inflight - 1)
+            self._inflight_since = 0.0
             return
         if kind == "clip":
             if self._clipboard_sync and message.get("dir") == "to_agent":
@@ -260,6 +293,18 @@ class AgentWorker:
         if kind == "bin":
             self._pairer.header(message)
             return
+
+    def _note_input(self, message: dict, applied: bool) -> None:
+        if not self._debug_input:
+            return
+        now = time.perf_counter()
+        if now - self._last_input_log < 1.0:
+            return
+        self._last_input_log = now
+        self._emit(
+            "log",
+            f"输入 {message.get('ev')} x={message.get('x')} y={message.get('y')} applied={applied}",
+        )
 
     async def _handle_binary(self, ws: aiohttp.ClientWebSocketResponse, data: bytes) -> None:
         try:
@@ -294,6 +339,34 @@ class AgentWorker:
         if self._active_session:
             await ws.send_str(encode({"t": "session_denied", "sid": session_id}))
             return
+        if self.config.session_code_policy == POLICY_DAILY and session_code.should_rotate(
+            POLICY_DAILY, self.config.code_rotated_at
+        ):
+            self.config.rotate_session_code()
+            self._save_config()
+            self._emit("log", f"验证码已更新：{self.config.session_code}")
+
+        code = str(message.get("code", ""))
+        if self.config.unattended and session_code.matches(self.config.session_code, code):
+            self._active_session = session_id
+            await ws.send_str(encode({"t": "session_accept", "sid": session_id}))
+            self._emit("log", f"{viewer} 凭验证码免确认接入（无人值守）")
+            return
+
+        if self.config.session_code_policy == POLICY_DAILY and session_code.should_rotate(
+            POLICY_DAILY, self.config.code_rotated_at
+        ):
+            self.config.rotate_session_code()
+            self._save_config()
+            self._emit("log", f"验证码已更新：{self.config.session_code}")
+
+        code = str(message.get("code", ""))
+        if self.config.unattended and session_code.matches(self.config.session_code, code):
+            self._active_session = session_id
+            await ws.send_str(encode({"t": "session_accept", "sid": session_id}))
+            self._emit("log", f"{viewer} 凭验证码免确认接入（无人值守）")
+            return
+
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._consent[session_id] = future
         self._emit("consent_request", {"sid": session_id, "viewer": viewer})
@@ -312,6 +385,12 @@ class AgentWorker:
         self._active_session = session_id
         await ws.send_str(encode({"t": "session_accept", "sid": session_id}))
         self._emit("log", f"{viewer} 已接入，等待中继放行")
+
+    def _save_config(self) -> None:
+        try:
+            self.config.save()
+        except OSError as exc:
+            self._emit("log", f"保存配置失败：{exc}")
 
     async def _on_session_start(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         if self._capturer is not None:
@@ -332,6 +411,7 @@ class AgentWorker:
         if self._capture_task and not self._capture_task.done():
             return
         self._inflight = 0
+        self._inflight_since = 0.0
         self._capture_task = asyncio.create_task(self._capture_loop(ws))
 
     def _stop_capture(self) -> None:
@@ -340,32 +420,48 @@ class AgentWorker:
         self._capture_task = None
         self._active_session = None
         self._inflight = 0
+        self._inflight_since = 0.0
 
     async def _capture_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         capturer = self._capturer
         if capturer is None:
+            self._emit("log", "抓屏不可用：capturer 未初始化")
             return
         sequence = 0
         try:
-            while not ws.closed:
-                if self._inflight > 0:
-                    await asyncio.sleep(0.004)
-                    continue
+            while not ws.closed and self._active_session:
+                if self._inflight >= MAX_INFLIGHT:
+                    if self._inflight_since and time.perf_counter() - self._inflight_since > ACK_TIMEOUT:
+                        # 应答在慢链路上丢了也别把帧流冻死
+                        self._inflight = 0
+                        self._inflight_since = 0.0
+                    else:
+                        await asyncio.sleep(0.004)
+                        continue
                 interval = 1.0 / max(1, self._fps)
                 started = time.perf_counter()
                 try:
                     payload, width, height = capturer.capture(self._scale, self._quality)
-                except OSError as exc:
-                    self._emit("log", f"抓屏失败：{exc}")
+                except Exception as exc:  # mss raises ScreenShotError, not OSError
+                    message = f"抓屏失败：{exc!r}"
+                    if message != self._last_capture_error:
+                        self._last_capture_error = message
+                        self._emit("log", message)
                     await asyncio.sleep(0.5)
                     continue
+                self._last_capture_error = ""
                 header = make_bin_header(
                     "frame", seq=sequence, size=len(payload), width=width, height=height
                 )
                 await ws.send_str(encode(header))
                 await ws.send_bytes(payload)
                 self._inflight += 1
+                if self._inflight_since == 0.0:
+                    self._inflight_since = time.perf_counter()
                 sequence += 1
+                if not self._first_frame_logged:
+                    self._first_frame_logged = True
+                    self._emit("log", f"首帧已发出 {width}x{height} {len(payload)}B")
                 elapsed = time.perf_counter() - started
                 await asyncio.sleep(max(0.0, interval - elapsed))
         except asyncio.CancelledError:
@@ -443,61 +539,169 @@ class AgentWindow:
 
         self.root = tk.Tk()
         self.root.title("远程桌面 · 被控端")
-        self.root.geometry("640x520")
-        self.root.minsize(520, 420)
+        self.root.geometry("900x680")
+        self.root.minsize(800, 560)
 
-        frame = ttk.Frame(self.root, padding=10)
-        frame.pack(fill="both", expand=True)
+        from ui.theme import AGENT_PAGES, PALETTE, apply_theme, format_ident
+
+        apply_theme(self.root)
+        self.root.configure(background=PALETTE["bg"])
 
         self.id_var = tk.StringVar(value=self.config.agent_id)
         self.name_var = tk.StringVar(value=self.config.name)
         self.url_var = tk.StringVar(value=self.config.relay_url)
         self.key_var = tk.StringVar(value=self.config.agent_key)
-        self.allow_var = tk.BooleanVar(value=self.config.allow_input)
-        self.clip_var = tk.BooleanVar(value=self.config.clipboard_sync)
-
-        ttk.Label(frame, text="本机 ID").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.id_var, width=14, state="readonly").grid(row=0, column=1, sticky="w")
-        copy_button = ttk.Button(frame, text="复制", width=6, command=self._copy_id)
-        copy_button.grid(row=0, column=2, sticky="w", padx=6)
-
-        ttk.Label(frame, text="设备名称").grid(row=1, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.name_var, width=28).grid(row=1, column=1, columnspan=2, sticky="we")
-
-        ttk.Label(frame, text="中继地址").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.url_var, width=42).grid(row=2, column=1, columnspan=2, sticky="we")
-
-        ttk.Label(frame, text="连接密钥").grid(row=3, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.key_var, width=42, show="*").grid(row=3, column=1, columnspan=2, sticky="we")
-
-        options = ttk.Frame(frame)
-        options.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 6))
-        ttk.Checkbutton(
-            options, text="允许鼠标键盘控制", variable=self.allow_var, command=self._apply_settings
-        ).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(
-            options, text="同步剪贴板", variable=self.clip_var, command=self._apply_settings
-        ).pack(side="left")
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        self.connect_button = ttk.Button(buttons, text="开始服务", command=self._start_service)
-        self.connect_button.pack(side="left")
-        self.stop_button = ttk.Button(buttons, text="停止服务", command=self._stop_service, state="disabled")
-        self.stop_button.pack(side="left", padx=6)
-        ttk.Button(buttons, text="向远控方发送文件…", command=self._pick_file).pack(side="left", padx=6)
-
+        self.allow_var = tk.BooleanVar(value=bool(self.config.allow_input))
+        self.clip_var = tk.BooleanVar(value=bool(self.config.clipboard_sync))
+        self.code_var = tk.StringVar(value=self.config.session_code)
+        self.unattended_var = tk.BooleanVar(value=bool(self.config.unattended))
+        self.policy_var = tk.StringVar(value=POLICY_LABELS[self.config.session_code_policy])
+        self.id_display = tk.StringVar(value=format_ident(self.config.agent_id))
+        self.code_display = tk.StringVar(value=format_ident(self.config.session_code))
         self.status_var = tk.StringVar(value="未启动")
-        status = ttk.Label(frame, textvariable=self.status_var, foreground="#1a5d1a")
-        status.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
-        self.log = scrolledtext.ScrolledText(frame, height=14, wrap="word", state="disabled")
-        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew")
-        frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(7, weight=1)
+        shell = ttk.Frame(self.root)
+        shell.pack(fill="both", expand=True)
+
+        side = ttk.Frame(shell, style="Sidebar.TFrame", width=188)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        ttk.Label(side, text="EthanDesk", style="Sidebar.TLabel",
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w", padx=18, pady=(20, 0))
+        ttk.Label(side, text="被控端 · Free", style="SidebarMuted.TLabel").pack(anchor="w", padx=18, pady=(2, 22))
+
+        self._nav_buttons = {}
+        for name in AGENT_PAGES:
+            button = ttk.Button(side, text=name, style="Nav.TButton",
+                                command=lambda n=name: self._show_page(n))
+            button.pack(fill="x", padx=8, pady=1)
+            self._nav_buttons[name] = button
+
+        foot = ttk.Frame(side, style="Sidebar.TFrame")
+        foot.pack(side="bottom", fill="x", padx=18, pady=16)
+        ttk.Label(foot, textvariable=self.status_var, style="SidebarMuted.TLabel",
+                  wraplength=150, justify="left").pack(anchor="w")
+
+        main = ttk.Frame(shell)
+        main.pack(side="left", fill="both", expand=True)
+        body = ttk.Frame(main)
+        body.pack(fill="both", expand=True, padx=22, pady=18)
+
+        self.pages = {
+            "远程协助": self._page_assist(body),
+            "设置": self._page_settings(body),
+        }
+        self._show_page("远程协助")
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._drain_events)
+
+    # ------------------------------------------------------------ page router
+    def _show_page(self, name: str) -> None:
+        pages = getattr(self, "pages", {})
+        if not pages:
+            return
+        for key, frame in pages.items():
+            if key == name:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
+        for key, button in getattr(self, "_nav_buttons", {}).items():
+            button.configure(style="NavOn.TButton" if key == name else "Nav.TButton")
+        self.active_page = name
+
+    def _page_assist(self, parent):
+        tk = self._tk
+        ttk = __import__("tkinter.ttk", fromlist=["ttk"])
+        scrolledtext = __import__("tkinter.scrolledtext", fromlist=["scrolledtext"])
+        from ui.theme import PALETTE
+
+        page = ttk.Frame(parent)
+
+        head = ttk.Frame(page)
+        head.pack(fill="x")
+        ttk.Label(head, text="远程协助本机", style="H1.TLabel").pack(side="left")
+        ttk.Label(head, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
+
+        ttk.Label(page, text="本机识别码", style="Muted.TLabel").pack(anchor="w", pady=(20, 0))
+        id_row = ttk.Frame(page)
+        id_row.pack(anchor="w", pady=(2, 0))
+        ttk.Label(id_row, textvariable=self.id_display, style="Ident.TLabel").pack(side="left")
+        ttk.Button(id_row, text="复制", style="Ghost.TButton", command=self._copy_id).pack(side="left", padx=12)
+
+        ttk.Label(page, text="单次验证码", style="Muted.TLabel").pack(anchor="w", pady=(18, 0))
+        code_row = ttk.Frame(page)
+        code_row.pack(anchor="w", pady=(2, 0))
+        ttk.Label(code_row, textvariable=self.code_display, style="Code.TLabel").pack(side="left")
+        ttk.Button(code_row, text="换一个", command=self._rotate_code).pack(side="left", padx=12)
+
+        options = ttk.Frame(page)
+        options.pack(fill="x", pady=(18, 0))
+        ttk.Checkbutton(options, text="无人值守（凭验证码免确认）", variable=self.unattended_var,
+                        command=self._apply_code_policy).pack(side="left")
+        ttk.Label(options, text="更新策略", style="Muted.TLabel").pack(side="left", padx=(24, 8))
+        policy_box = ttk.Combobox(options, textvariable=self.policy_var, width=16, state="readonly",
+                                  values=tuple(POLICY_LABELS.values()))
+        policy_box.pack(side="left")
+        policy_box.bind("<<ComboboxSelected>>", lambda _event: self._apply_code_policy())
+
+        actions = ttk.Frame(page)
+        actions.pack(fill="x", pady=(18, 10))
+        self.connect_button = ttk.Button(actions, text="开始服务", style="Accent.TButton",
+                                         command=self._start_service)
+        self.connect_button.pack(side="left")
+        self.stop_button = ttk.Button(actions, text="停止服务", command=self._stop_service, state="disabled")
+        self.stop_button.pack(side="left", padx=8)
+        ttk.Button(actions, text="向远控方发送文件…", command=self._pick_file).pack(side="left", padx=8)
+
+        ttk.Label(page, text="日志", style="Section.TLabel").pack(anchor="w", pady=(10, 4))
+        self.log = scrolledtext.ScrolledText(page, height=12, wrap="word", state="disabled",
+                                             background=PALETTE["panel"], foreground=PALETTE["text"],
+                                             insertbackground=PALETTE["text"], borderwidth=0,
+                                             font=("Consolas", 9))
+        self.log.pack(fill="both", expand=True)
+        return page
+
+    def _page_settings(self, parent):
+        ttk = __import__("tkinter.ttk", fromlist=["ttk"])
+        from ui.theme import PALETTE, format_ident
+
+        page = ttk.Frame(parent)
+        ttk.Label(page, text="设置", style="H1.TLabel").pack(anchor="w", pady=(4, 12))
+
+        grid = ttk.Frame(page)
+        grid.pack(fill="x")
+        ttk.Label(grid, text="设备名称", style="Muted.TLabel").grid(row=0, column=0, sticky="w", pady=7)
+        ttk.Entry(grid, textvariable=self.name_var, width=34).grid(row=0, column=1, sticky="w", padx=16)
+        ttk.Label(grid, text="中继地址", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=7)
+        ttk.Entry(grid, textvariable=self.url_var, width=48).grid(row=1, column=1, sticky="w", padx=16)
+        ttk.Label(grid, text="连接密钥", style="Muted.TLabel").grid(row=2, column=0, sticky="w", pady=7)
+        ttk.Entry(grid, textvariable=self.key_var, width=48, show="*").grid(row=2, column=1, sticky="w", padx=16)
+        ttk.Label(grid, text="更新策略", style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=7)
+        ttk.Combobox(grid, textvariable=self.policy_var, width=16, state="readonly",
+                     values=tuple(POLICY_LABELS.values())).grid(row=3, column=1, sticky="w", padx=16)
+        ttk.Label(grid, text="下载目录", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=7)
+        ttk.Label(grid, text=self.config.download_dir, style="Muted.TLabel").grid(
+            row=4, column=1, sticky="w", padx=16)
+
+        checks = ttk.Frame(page)
+        checks.pack(anchor="w", pady=(16, 0))
+        ttk.Checkbutton(checks, text="允许鼠标键盘控制", variable=self.allow_var,
+                        command=self._apply_settings).pack(side="left")
+        ttk.Checkbutton(checks, text="同步剪贴板", variable=self.clip_var,
+                        command=self._apply_settings).pack(side="left", padx=18)
+
+        bar = ttk.Frame(page)
+        bar.pack(anchor="w", pady=(18, 0))
+        ttk.Button(bar, text="保存配置", style="Accent.TButton",
+                   command=self._save_window_config).pack(side="left")
+        return page
+
+    def _refresh_code_display(self) -> None:
+        from ui.theme import format_ident
+
+        self.code_display.set(format_ident(self.config.session_code))
+
 
     # ------------------------------------------------------------ ui helpers
     def _copy_id(self) -> None:
@@ -509,6 +713,25 @@ class AgentWindow:
         self.log.insert("end", f"{time.strftime('%H:%M:%S')}  {text}\n")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _rotate_code(self) -> None:
+        self.config.rotate_session_code()
+        self.code_var.set(self.config.session_code)
+        self._refresh_code_display()
+        self._save_window_config()
+
+    def _apply_code_policy(self) -> None:
+        self.config.session_code_policy = POLICY_BY_LABEL.get(
+            self.policy_var.get(), POLICY_EVERY_SESSION
+        )
+        self.config.unattended = bool(self.unattended_var.get())
+        self._save_window_config()
+
+    def _save_window_config(self) -> None:
+        try:
+            self.config.save()
+        except OSError as exc:
+            self._append_log(f"保存配置失败：{exc}")
 
     def _apply_settings(self) -> None:
         self.worker.apply_settings(
@@ -581,6 +804,12 @@ class AgentWindow:
 
 
 def main() -> None:
+    # Must happen before the first capture and before Tk builds its widgets: without it
+    # the process sees a logical desktop (1536x864 at 125%) while mss grabs physical
+    # pixels (1920x1080), and every remote click lands 20% short of the intended point.
+    from common.dpi import ensure_dpi_aware
+
+    ensure_dpi_aware()
     AgentWindow().run()
 
 

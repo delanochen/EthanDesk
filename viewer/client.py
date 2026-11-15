@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import quote
+from urllib.parse import quote
 
 import aiohttp
 
@@ -127,12 +129,16 @@ class DeskClient:
             raise DeskClientError(f"读取会话记录失败：HTTP {response.status}")
         return list((await response.json()).get("sessions", []))
 
-    async def open_session(self, agent_id: str) -> Session:
+    async def open_session(self, agent_id: str, code: str = "") -> Session:
         if not self.token:
             await self.login()
         url = (
             f"{to_ws_base(self.base_url)}/ws/session?agent_id={agent_id}&token={self.token}"
         )
+        if code:
+            url += f"&code={quote(code)}"
+        if code:
+            url += f"&code={quote(code)}"
         try:
             ws = await self._session.ws_connect(url, heartbeat=30, max_msg_size=0)
         except aiohttp.ClientError as exc:
