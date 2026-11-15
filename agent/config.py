@@ -54,6 +54,8 @@ class AgentConfig:
     code_rotated_at: float = 0.0
     unattended: bool = False
     verify_cert: bool = True
+    # 首页「允许他人协助本机」的开关状态：装上即可被协助，关掉的选择要记住。
+    serve_on_start: bool = True
 
     def info(self) -> dict:
         return {

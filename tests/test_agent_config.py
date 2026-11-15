@@ -50,3 +50,11 @@ def test_load_ignores_unknown_keys(tmp_path):
     path.write_text(json.dumps({"agent_id": "123456789", "future_option": 1}), encoding="utf-8")
     loaded = AgentConfig.load(str(path))
     assert loaded.agent_id == "123456789"
+
+
+def test_serve_on_start_defaults_to_true_and_round_trips(tmp_path):
+    """和向日葵一样，装上就该能被协助；关掉的人要记住这个选择。"""
+    assert AgentConfig().serve_on_start is True
+    path = tmp_path / "agent.json"
+    AgentConfig(serve_on_start=False).save(str(path))
+    assert AgentConfig.load(str(path)).serve_on_start is False

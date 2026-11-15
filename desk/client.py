@@ -108,12 +108,19 @@ class DeskWindow:
         self.auto_var = tk.BooleanVar(value=bool(self.viewer_config.auto_quality))
         self.adaptive_note = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="未启动")
+        self.serve_var = tk.BooleanVar(value=False)
+        self._relay_state = "connecting"
+        self.serve_status = tk.StringVar(value="已关闭")
         self.metric_var = tk.StringVar(value="")
         self.login_info = tk.StringVar(value="未登录")
 
         self._build_layout()
         self.root.after(60, self._drain)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if start_threads and self.agent_config.serve_on_start:
+            # 和向日葵一样：装好就能被协助，不需要再点一次“开始服务”。
+            self.serve_var.set(True)
+            self._start_agent()
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -221,11 +228,12 @@ class DeskWindow:
         header = ttk.Frame(page)
         header.pack(fill="x", pady=(6, 0))
         ttk.Label(header, text="远程协助本机", style="H1.TLabel").pack(side="left")
-        self.agent_toggle = self._pill(header, self.unattended_var)
-        self.agent_toggle.pack(side="left", padx=12)
-        ttk.Button(header, text="开始服务", style="Accent.TButton",
-                   command=self._start_agent).pack(side="left", padx=6)
-        ttk.Button(header, text="停止服务", command=self._stop_agent).pack(side="left")
+        self.serve_toggle = ttk.Checkbutton(header, text="允许他人协助本机",
+                                            variable=self.serve_var, command=self._toggle_serve)
+        self.serve_toggle.pack(side="left", padx=14)
+        ttk.Label(header, textvariable=self.serve_status, style="Muted.TLabel").pack(side="left")
+        ttk.Label(page, text="打开后本机会自动在中继上线；只有中继确认在线才会显示“可接收协助”。",
+                  style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
 
         grid = ttk.Frame(page)
         grid.pack(fill="x", pady=(18, 6))
@@ -437,6 +445,15 @@ class DeskWindow:
         self._policy_row(frame)
         ttk.Label(frame, text="接收文件保存位置", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
         ttk.Label(frame, text=self.agent_config.download_dir).pack(anchor="w")
+
+        ttk.Label(frame, text="高级：服务手动启停", style="Section.TLabel").pack(anchor="w", pady=(18, 4))
+        ttk.Label(frame, text="首页开关会自动启停服务；这里只用于排查中继连不上等问题。",
+                  style="Muted.TLabel").pack(anchor="w")
+        manual = ttk.Frame(frame)
+        manual.pack(anchor="w", pady=(6, 0))
+        ttk.Button(manual, text="手动启动服务", command=self._start_agent).pack(side="left")
+        ttk.Button(manual, text="手动停止服务", command=self._stop_agent).pack(side="left", padx=8)
+
         ttk.Button(frame, text="保存", style="Accent.TButton",
                    command=self._save_agent_config).pack(anchor="w", pady=14)
         return frame
@@ -446,8 +463,8 @@ class DeskWindow:
         frame = ttk.Frame(parent)
         ttk.Label(frame, text="安全", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
         ttk.Label(frame, text="他人远控本机时，建议设置以下安全防护", style="Muted.TLabel").pack(anchor="w")
-        ttk.Checkbutton(frame, text="允许远程协助本机", variable=self.allow_var,
-                        command=self._apply_agent_settings).pack(anchor="w", pady=8)
+        ttk.Checkbutton(frame, text="允许他人协助本机（开启即在中继上线）", variable=self.serve_var,
+                        command=self._toggle_serve).pack(anchor="w", pady=8)
 
         box = ttk.Frame(frame, style="Card.TFrame", padding=14)
         box.pack(fill="x", pady=(6, 10))
@@ -672,6 +689,24 @@ class DeskWindow:
     def _refresh_agents(self) -> None:
         self.viewer_commands.put(("refresh_agents", None))
 
+    def _refresh_serve_status(self) -> None:
+        from desk.serve_state import serve_status_text
+
+        self.serve_status.set(serve_status_text(bool(self.serve_var.get()), self._relay_state))
+
+    def _toggle_serve(self) -> None:
+        """首页的唯一入口：开=启动服务并等待中继确认，关=停止服务。"""
+        enabled = bool(self.serve_var.get())
+        self.agent_config.serve_on_start = enabled
+        self._save_agent_config()
+        if enabled:
+            self._relay_state = "connecting"
+            self._refresh_serve_status()
+            self._start_agent()
+        else:
+            self._stop_agent()
+            self._refresh_serve_status()
+
     def _start_agent(self) -> None:
         self.agent_config.relay_url = self.agent_url_var.get().strip()
         self.agent_config.agent_key = self.key_var.get().strip()
@@ -679,12 +714,15 @@ class DeskWindow:
         self._save_agent_config()
         self.agent_worker.start()
         self.agent_running = True
+        self._relay_state = "connecting"
         self.status_var.set("正在连接中继…")
+        self._refresh_serve_status()
 
     def _stop_agent(self) -> None:
         self.agent_worker.stop()
         self.agent_running = False
         self.status_var.set("已停止")
+        self._refresh_serve_status()
 
     def _copy_ident(self) -> None:
         self.root.clipboard_clear()
@@ -713,9 +751,6 @@ class DeskWindow:
         self.agent_config.session_code_policy = self._policy_value()
         self.agent_config.unattended = bool(self.unattended_var.get())
         self._save_agent_config()
-        for widget in (getattr(self, "agent_toggle", None),):
-            if widget is not None and hasattr(widget, "_draw"):
-                widget._draw()
 
     def _apply_agent_settings(self) -> None:
         self.agent_config.allow_input = bool(self.allow_var.get())
@@ -873,8 +908,10 @@ class DeskWindow:
             if kind == "log":
                 self._append_log(str(payload))
             elif kind == "status":
+                self._relay_state = str(payload)
                 self.status_var.set({"online": "在线，等待远控", "offline": "离线",
                                      "connecting": "连接中…"}.get(str(payload), str(payload)))
+                self._refresh_serve_status()
             elif kind == "consent_request":
                 self._prompt_consent(payload)
 
