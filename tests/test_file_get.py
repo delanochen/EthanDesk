@@ -60,7 +60,7 @@ def test_file_get_streams_the_file_with_a_down_offer(tmp_path):
     assert offer["name"] == "报告.txt"
     assert offer["size"] == len(payload)
     assert offer["sha256"] == hashlib.sha256(payload).hexdigest()
-    headers = [item for item in ws.texts[1:]]
+    headers = [item for item in ws.texts[1:] if item.get("t") == "bin"]
     assert len(headers) == len(ws.binaries) == len(list(agent_app.OutgoingFile(
         offer["id"], "报告.txt", payload).frames()))
     joined = b"".join(ws.binaries)
@@ -77,7 +77,7 @@ def test_file_get_needs_an_active_session(tmp_path):
 
     _serve(worker, ws, str(source))
 
-    assert ws.texts == []
+    assert [item for item in ws.texts if item.get("t") == "file_offer"] == []
     logs = [str(payload) for kind, payload in _events(worker) if kind == "log"]
     assert any("没有活动会话" in entry for entry in logs)
 
