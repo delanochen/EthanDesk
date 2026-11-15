@@ -120,6 +120,43 @@ def test_quoted_path_is_accepted(tmp_path):
     assert reason == ""
 
 
+def test_get_offer_on_the_text_path_streams_the_file(tmp_path):
+    """线上中继丢未知类型，所以请求走 file_offer/direction="get"，这条路径必须能用。"""
+    source = tmp_path / "via-offer.txt"
+    source.write_bytes(b"carrier" * 1000)
+    worker = _worker()
+    worker._active_session = "sid-1"
+    ws = _FakeWs()
+
+    asyncio.run(
+        worker._handle_text(
+            ws, {"t": "file_offer", "direction": "get", "path": str(source)}
+        )
+    )
+
+    assert ws.texts[0]["t"] == "file_offer"
+    assert ws.texts[0]["direction"] == "down"
+    assert ws.texts[0]["name"] == "via-offer.txt"
+
+
+def test_incoming_up_offer_still_goes_to_the_receiver(tmp_path):
+    worker = _worker()
+    worker.config.download_dir = str(tmp_path)
+    asyncio.run(
+        worker._handle_text(
+            _FakeWs(),
+            {
+                "t": "file_offer",
+                "direction": "up",
+                "id": "abc",
+                "name": "up.txt",
+                "size": 3,
+            },
+        )
+    )
+    assert "abc" in worker._incoming
+
+
 def test_file_get_survives_the_wire_protocol():
     """file_get 必须在 KNOWN_TYPES 里，否则 decode 直接返 None，消息发出去就没了。"""
     from common.protocol import decode, encode
@@ -136,7 +173,7 @@ class _StubSession:
         self.sent.append(message)
 
 
-def test_viewer_requests_a_download_with_file_get():
+def test_viewer_requests_a_download_through_the_known_offer_type():
     worker = ViewerWorker(queue.Queue(), queue.Queue())
     session = _StubSession()
 
@@ -146,7 +183,13 @@ def test_viewer_requests_a_download_with_file_get():
 
     asyncio.run(run())
 
-    assert session.sent == [{"t": "file_get", "path": r"C:\Users\admin\Desktop\报告.docx"}]
+    assert session.sent == [
+        {
+            "t": "file_offer",
+            "direction": "get",
+            "path": r"C:\Users\admin\Desktop\报告.docx",
+        }
+    ]
     logs = [str(payload) for kind, payload in _drain(worker) if kind == "log"]
     assert any("已请求下载" in entry for entry in logs)
 

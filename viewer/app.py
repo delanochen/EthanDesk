@@ -436,7 +436,8 @@ class ViewerWorker:
             self._emit("error", "远程路径为空")
             return
         self._last_remote_path = path
-        await session.send_text({"t": "file_get", "path": path})
+        # 线上中继不转发未知类型，所以请求借 file_offer 承载，direction="get"。
+        await session.send_text({"t": "file_offer", "direction": "get", "path": path})
         self._emit("log", f"已请求下载 {os.path.basename(path)}")
 
     async def _clipboard_loop(self) -> None:

@@ -337,7 +337,12 @@ class AgentWorker:
                     self._emit("log", f"写入剪贴板失败：{exc}")
             return
         if kind == "file_offer":
-            self._open_incoming(message)
+            # 线上中继只转发它认识的类型，所以「远端取文件」借用 file_offer 承载，
+            # 用 direction="get" 表达请求；file_get 留给升级后的中继直连。
+            if message.get("direction") == "get":
+                await self._serve_get(ws, message)
+            else:
+                self._open_incoming(message)
             return
         if kind == "file_get":
             await self._serve_get(ws, message)

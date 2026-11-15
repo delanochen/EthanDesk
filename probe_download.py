@@ -54,8 +54,9 @@ async def main(remote_path: str, wait_seconds: float) -> None:
 
         async def request() -> None:
             await asyncio.sleep(1.0)
-            print(f"file_get {remote_path}", flush=True)
-            await session.send_text({"t": "file_get", "path": remote_path})
+            print(f"pull {remote_path}", flush=True)
+            # 线上中继只转发已知类型，请求借 file_offer 承载（direction="get"）。
+            await session.send_text({"t": "file_offer", "direction": "get", "path": remote_path})
 
         task = asyncio.create_task(request())
         while time.time() - started < wait_seconds:
