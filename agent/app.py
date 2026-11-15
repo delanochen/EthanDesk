@@ -52,6 +52,9 @@ SETTINGS_GRACE = 3.0
 # 主控端能远程取走的单个文件上限。整份读进内存再分块发，超过这个尺寸先把请求拒掉，
 # 免得被一个大文件把被控端进程撑爆。
 MAX_PULL_BYTES = 512 * 1024 * 1024
+# 一次目录列举最多回多少条：远程文件浏览器只需要看一屏，巨目录全列会把消息撑大，
+# 主控端也没法读。
+MAX_LIST_ENTRIES = 500
 
 
 def link_stalled(last_rx: float, now: float) -> bool:
@@ -338,9 +341,13 @@ class AgentWorker:
             return
         if kind == "file_offer":
             # 线上中继只转发它认识的类型，所以「远端取文件」借用 file_offer 承载，
-            # 用 direction="get" 表达请求；file_get 留给升级后的中继直连。
-            if message.get("direction") == "get":
+            # 用 direction="get" 表达请求、direction="list" 表达列目录；
+            # file_get 留给升级后的中继直连。
+            direction = message.get("direction")
+            if direction == "get":
                 await self._serve_get(ws, message)
+            elif direction == "list":
+                await self._serve_list(ws, message)
             else:
                 self._open_incoming(message)
             return
@@ -638,6 +645,72 @@ class AgentWorker:
             await self._notify_viewer(ws, f"远端取文件被拒绝：{reason}")
             return
         await self._push_file(ws, path, reason="远端取文件")
+
+    def list_directory(self, raw: str) -> tuple[list[dict], str, str]:
+        """List one directory for the viewer's remote file browser.
+
+        Returns ``(entries, directory, error)``. An empty path means "顶层"：Windows
+        上回各盘符根目录，方便主控端一开始就有东西可点；其它情况必须是可读的绝对
+        目录。条目按"目录优先、名字升序"排好，最多 ``MAX_LIST_ENTRIES`` 条。
+        """
+        text = str(raw or "").strip().strip('"').strip("'")
+        if "~" in text or "%" in text:
+            text = os.path.expandvars(os.path.expanduser(text))
+        if not text:
+            drives = []
+            if os.name == "nt":
+                for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                    root = f"{letter}:\\"
+                    if os.path.isdir(root):
+                        drives.append({"name": root, "dir": True, "size": 0})
+            if not drives:
+                return [], "", "没有可访问的磁盘"
+            return drives, "", ""
+        if not os.path.isabs(text):
+            return [], "", f"只接受绝对路径：{raw}"
+        if not os.path.isdir(text):
+            return [], "", f"目录不存在：{raw}"
+        entries: list[dict] = []
+        try:
+            with os.scandir(text) as iterator:
+                for item in iterator:
+                    try:
+                        is_dir = item.is_dir()
+                        size = 0 if is_dir else item.stat().st_size
+                    except OSError:
+                        continue
+                    entries.append({"name": item.name, "dir": is_dir, "size": size})
+                    if len(entries) >= MAX_LIST_ENTRIES:
+                        break
+        except OSError as exc:
+            return [], text, f"读取目录失败：{exc}"
+        entries.sort(key=lambda entry: (not entry["dir"], entry["name"].lower()))
+        return entries, text, ""
+
+    async def _serve_list(
+        self, ws: aiohttp.ClientWebSocketResponse, message: dict
+    ) -> None:
+        if not self._active_session:
+            await self._notify_viewer(ws, "没有活动会话，已拒绝远端列目录请求")
+            return
+        entries, directory, error = self.list_directory(str(message.get("path", "")))
+        payload = {
+            "t": "meta",
+            "kind": "file_list",
+            "path": directory,
+            "entries": entries,
+            "error": error,
+        }
+        self._emit(
+            "log",
+            f"列目录被拒绝：{error}" if error else f"列出目录 {directory}（{len(entries)} 项）",
+        )
+        if ws.closed:
+            return
+        try:
+            await ws.send_str(encode(payload))
+        except (ConnectionResetError, RuntimeError):
+            pass
 
     def _open_incoming(self, message: dict) -> None:
         transfer_id = str(message.get("id", ""))
