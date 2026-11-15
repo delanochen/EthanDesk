@@ -23,6 +23,7 @@ from agent import clip, inject, screen
 from agent.config import AgentConfig
 from agent.files_transfer import FileTransferError, IncomingFile, OutgoingFile
 from common import session_code
+from common.listing import list_directory as scan_directory
 from common.protocol import BinaryPairer, ProtocolError, decode, encode, make_bin_header
 from common.session_code import POLICY_DAILY, POLICY_EVERY_SESSION, POLICY_NEVER
 
@@ -349,7 +350,9 @@ class AgentWorker:
             elif direction == "list":
                 await self._serve_list(ws, message)
             else:
-                self._open_incoming(message)
+                refusal = self._open_incoming(message)
+                if refusal:
+                    await self._notify_viewer(ws, refusal)
             return
         if kind == "file_get":
             await self._serve_get(ws, message)
@@ -649,43 +652,10 @@ class AgentWorker:
     def list_directory(self, raw: str) -> tuple[list[dict], str, str]:
         """List one directory for the viewer's remote file browser.
 
-        Returns ``(entries, directory, error)``. An empty path means "顶层"：Windows
-        上回各盘符根目录，方便主控端一开始就有东西可点；其它情况必须是可读的绝对
-        目录。条目按"目录优先、名字升序"排好，最多 ``MAX_LIST_ENTRIES`` 条。
+        具体规则在 ``common/listing.py``，这里只负责套上被控端的条数上限，这样
+        主控端本地栏和被控端远端栏不会走出两套不同的行为。
         """
-        text = str(raw or "").strip().strip('"').strip("'")
-        if "~" in text or "%" in text:
-            text = os.path.expandvars(os.path.expanduser(text))
-        if not text:
-            drives = []
-            if os.name == "nt":
-                for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-                    root = f"{letter}:\\"
-                    if os.path.isdir(root):
-                        drives.append({"name": root, "dir": True, "size": 0})
-            if not drives:
-                return [], "", "没有可访问的磁盘"
-            return drives, "", ""
-        if not os.path.isabs(text):
-            return [], "", f"只接受绝对路径：{raw}"
-        if not os.path.isdir(text):
-            return [], "", f"目录不存在：{raw}"
-        entries: list[dict] = []
-        try:
-            with os.scandir(text) as iterator:
-                for item in iterator:
-                    try:
-                        is_dir = item.is_dir()
-                        size = 0 if is_dir else item.stat().st_size
-                    except OSError:
-                        continue
-                    entries.append({"name": item.name, "dir": is_dir, "size": size})
-                    if len(entries) >= MAX_LIST_ENTRIES:
-                        break
-        except OSError as exc:
-            return [], text, f"读取目录失败：{exc}"
-        entries.sort(key=lambda entry: (not entry["dir"], entry["name"].lower()))
-        return entries, text, ""
+        return scan_directory(raw, limit=MAX_LIST_ENTRIES)
 
     async def _serve_list(
         self, ws: aiohttp.ClientWebSocketResponse, message: dict
@@ -712,23 +682,35 @@ class AgentWorker:
         except (ConnectionResetError, RuntimeError):
             pass
 
-    def _open_incoming(self, message: dict) -> None:
+    def _open_incoming(self, message: dict) -> str:
+        """开一个入站文件；返回拒绝原因（空串表示已接受）。
+
+        主控端可以带 ``dir`` 指定落到哪个远端目录（双击远端目录后上传就用它），
+        不带就落到 ``download_dir``。目录必须是已存在的绝对路径，否则明确拒绝，
+        免得文件悄悄落在别的地方。
+        """
         transfer_id = str(message.get("id", ""))
         if message.get("direction") != "up":
-            return
+            return ""
+        target_dir = self.config.download_dir
+        raw_dir = str(message.get("dir") or "").strip().strip('"').strip("'")
+        if raw_dir:
+            if not os.path.isabs(raw_dir) or not os.path.isdir(raw_dir):
+                return f"上传被拒绝：目标目录无效：{raw_dir}"
+            target_dir = raw_dir
         try:
             incoming = IncomingFile(
                 transfer_id,
                 str(message.get("name", "file.bin")),
                 int(message.get("size", 0)),
-                self.config.download_dir,
+                target_dir,
                 message.get("sha256"),
             )
         except (FileTransferError, ValueError) as exc:
-            self._emit("log", f"文件请求无效：{exc}")
-            return
+            return f"文件请求无效：{exc}"
         self._incoming[transfer_id] = incoming
-        self._emit("log", f"接收文件：{incoming.name}（{incoming.expected_size} bytes）")
+        self._emit("log", f"接收文件：{incoming.name}（{incoming.expected_size} bytes）→ {target_dir}")
+        return ""
 
 
 def uuid_hex() -> str:

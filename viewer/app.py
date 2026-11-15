@@ -162,7 +162,8 @@ class ViewerWorker:
                 self._emit("auto_quality", self._auto_quality)
             elif action == "upload" and self._session is not None:
                 path = payload.get("path", "") if isinstance(payload, dict) else payload
-                await self._upload(str(path))
+                remote_dir = str(payload.get("dir", "")) if isinstance(payload, dict) else ""
+                await self._upload(str(path), remote_dir)
             elif action == "download" and self._session is not None:
                 path = payload.get("path", "") if isinstance(payload, dict) else payload
                 await self._request_download(str(path))
@@ -416,7 +417,7 @@ class ViewerWorker:
         except (FileTransferError, ValueError) as exc:
             self._emit("error", f"文件请求无效：{exc}")
 
-    async def _upload(self, path: str) -> None:
+    async def _upload(self, path: str, remote_dir: str = "") -> None:
         session = self._session
         if session is None:
             return
@@ -427,10 +428,16 @@ class ViewerWorker:
             self._emit("error", f"读取文件失败：{exc}")
             return
         outgoing = OutgoingFile(os.urandom(6).hex(), os.path.basename(path), data, direction="up")
-        await session.send_text(outgoing.offer())
+        offer = outgoing.offer()
+        target = str(remote_dir or "").strip()
+        if target:
+            # 主控端选了远端目录：让被控端落到那个目录，而不是默认的 download_dir。
+            offer["dir"] = target
+        await session.send_text(offer)
         for header, chunk in outgoing.frames():
             await session.send_bin(header, chunk)
-        self._emit("log", f"已上传：{os.path.basename(path)}")
+        where = f" → {target}" if target else ""
+        self._emit("log", f"已上传：{os.path.basename(path)}{where}")
 
     async def _request_download(self, remote_path: str) -> None:
         """Ask the agent for a file; the agent answers with a direction="down" offer."""
@@ -500,9 +507,10 @@ class ViewerWindow:
         self.clipboard_enabled = False
         self.last_clip_text = ""
         self._pending_move: tuple[float, float] | None = None
-        # 远程文件窗口：打开着的对话框对象，以及上次访问的远端目录
+        # 远程文件窗口：打开着的对话框对象，以及上次访问的远端 / 本机目录
         self.remote_dialog = None
         self.last_remote_dir = ""
+        self.last_local_dir = ""
 
         self.root = tk.Tk()
         self.root.title("远程桌面 · 主控端")
@@ -1141,11 +1149,118 @@ class ViewerWindow:
         self.root.mainloop()
 
 
-class RemoteFileDialog:
-    """向日葵式远程文件窗口：列被控端目录、双击进目录、选中文件下载。
+class FilePane:
+    """双栏窗口里的一侧：本机栏自己扫本地盘，远端栏等被控端回 meta/file_list。
 
-    目录数据由 ``ViewerWorker`` 通过 ``remote_list`` 事件送回来，窗口本身不碰网络，
-    只把 ``("list", path)`` / ``("download", path)`` 塞进命令队列。
+    只负责显示与导航；真正发请求、收文件都交给 ``RemoteFileDialog`` 转给
+    ``ViewerWorker``，这样这一层没有任何网络/线程逻辑，测试起来也简单。
+    """
+
+    def __init__(self, dialog: "RemoteFileDialog", parent, title: str, *, remote: bool,
+                 initial: str, width: int = 26) -> None:
+        import tkinter as tk
+
+        self.dialog = dialog
+        self.remote = remote
+        self.frame = tk.Frame(parent)
+        tk.Label(self.frame, text=title, anchor="w").pack(fill="x")
+
+        bar = tk.Frame(self.frame)
+        bar.pack(fill="x", pady=(4, 4))
+        tk.Button(bar, text="上级", width=5, command=self.go_up).pack(side="left")
+        self.path_var = tk.StringVar(value=initial or "")
+        entry = tk.Entry(bar, textvariable=self.path_var)
+        entry.pack(side="left", fill="x", expand=True, padx=4)
+        entry.bind("<Return>", lambda _event: self.refresh())
+        tk.Button(bar, text="刷新", width=5, command=self.refresh).pack(side="left")
+
+        body = tk.Frame(self.frame)
+        body.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(body, activestyle="none", width=width, exportselection=False)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(body, orient="vertical", command=self.listbox.yview)
+        scroll.pack(side="right", fill="y")
+        self.listbox.configure(yscrollcommand=scroll.set)
+        self.listbox.bind("<Double-Button-1>", self._on_open)
+
+        self.footer = tk.StringVar(value="")
+        tk.Label(self.frame, textvariable=self.footer, anchor="w").pack(fill="x", pady=(4, 0))
+        self.entries: list[dict] = []
+
+    # ------------------------------------------------------------------ loading
+    def refresh(self) -> None:
+        if self.remote:
+            self.dialog.request_remote(self.path_var.get())
+        else:
+            self.load_local(self.path_var.get())
+
+    def load_local(self, path: str) -> None:
+        from common.listing import list_directory
+
+        entries, directory, error = list_directory(path, 500)
+        self.show(entries, directory, error)
+
+    def show(self, entries: list[dict], directory: str, error: str) -> None:
+        if directory:
+            self.path_var.set(directory)
+        self.entries = list(entries)
+        self.listbox.delete(0, "end")
+        for entry in self.entries:
+            name = str(entry.get("name", ""))
+            if entry.get("dir"):
+                label = f"[{name}]"
+            else:
+                label = f" {name}    {format_size(int(entry.get('size') or 0))}"
+            self.listbox.insert("end", label)
+        if error:
+            self.footer.set(f"拒绝：{error}")
+        else:
+            cut = "（已截断）" if len(self.entries) >= 500 else ""
+            self.footer.set(f"{directory or '顶层'} · {len(self.entries)} 项{cut}")
+
+    # ------------------------------------------------------------------ actions
+    def go_up(self) -> None:
+        from common.listing import parent_of
+
+        self.path_var.set(parent_of(self.path_var.get()))
+        self.refresh()
+
+    def _on_open(self, _event=None) -> None:
+        entry = self.selected()
+        if entry is None:
+            return
+        if entry.get("dir"):
+            base = self.path_var.get().rstrip("\\/")
+            name = str(entry.get("name", ""))
+            self.path_var.set(f"{base}\\{name}" if base else name)
+            self.refresh()
+        else:
+            self.dialog.activate(self)
+
+    def selected(self) -> dict | None:
+        selection = self.listbox.curselection()
+        if not selection:
+            return None
+        index = selection[0]
+        return self.entries[index] if 0 <= index < len(self.entries) else None
+
+    def selected_path(self) -> str:
+        entry = self.selected()
+        if entry is None:
+            return ""
+        base = self.path_var.get().rstrip("\\/")
+        name = str(entry.get("name", ""))
+        return f"{base}\\{name}" if base else name
+
+    def directory(self) -> str:
+        return self.path_var.get().rstrip("\\/")
+
+
+class RemoteFileDialog:
+    """向日葵式远程文件窗口：左边本机、右边被控端，中间上传/下载。
+
+    远端目录数据由 ``ViewerWorker`` 通过 ``remote_list`` 事件送回，窗口只往命令
+    队列塞 ``("list", path)`` / ``("download", path)`` / ``("upload", {...})``。
     """
 
     def __init__(self, window: "ViewerWindow") -> None:
@@ -1154,97 +1269,100 @@ class RemoteFileDialog:
         self.window = window
         self.top = tk.Toplevel(window.root)
         self.top.title("远程文件")
-        self.top.geometry("720x460")
+        self.top.geometry("1080x560")
+        self.top.minsize(820, 420)
         self.top.transient(window.root)
 
-        bar = tk.Frame(self.top)
-        bar.pack(fill="x", padx=10, pady=(10, 4))
-        tk.Button(bar, text="上一级", width=8, command=self.go_up).pack(side="left")
-        self.path_var = tk.StringVar(value=window.last_remote_dir or "")
-        entry = tk.Entry(bar, textvariable=self.path_var)
-        entry.pack(side="left", fill="x", expand=True, padx=8)
-        entry.bind("<Return>", lambda _event: self.refresh())
-        tk.Button(bar, text="刷新", width=6, command=self.refresh).pack(side="left")
-
         body = tk.Frame(self.top)
-        body.pack(fill="both", expand=True, padx=10)
-        self.listbox = tk.Listbox(body, activestyle="none")
-        self.listbox.pack(side="left", fill="both", expand=True)
-        scroll = tk.Scrollbar(body, orient="vertical", command=self.listbox.yview)
-        scroll.pack(side="right", fill="y")
-        self.listbox.configure(yscrollcommand=scroll.set)
-        self.listbox.bind("<Double-Button-1>", self._on_open)
+        body.pack(fill="both", expand=True, padx=10, pady=(10, 4))
 
-        self.status_var = tk.StringVar(value="正在请求目录…")
+        local_start = window.last_local_dir or os.path.expanduser("~")
+        self.local = FilePane(
+            self, body, f"本机 · {os.environ.get('COMPUTERNAME', '这台电脑')}",
+            remote=False, initial=local_start,
+        )
+        self.local.frame.pack(side="left", fill="both", expand=True)
+
+        middle = tk.Frame(body)
+        middle.pack(side="left", fill="y", padx=10)
+        tk.Label(middle, text="").pack(pady=60)
+        tk.Button(middle, text="上传 →", width=9, command=self.upload_selected).pack(pady=4)
+        tk.Button(middle, text="← 下载", width=9, command=self.download_selected).pack(pady=4)
+
+        self.remote_pane = FilePane(
+            self, body, "远端 · 被控端", remote=True, initial=window.last_remote_dir or "",
+        )
+        self.remote_pane.frame.pack(side="left", fill="both", expand=True)
+
+        self.status_var = tk.StringVar(value="正在请求远端目录…")
         foot = tk.Frame(self.top)
         foot.pack(fill="x", padx=10, pady=(6, 10))
         tk.Label(foot, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
-        tk.Button(foot, text="下载所选文件", command=self.download_selected).pack(side="right")
+        tk.Button(foot, text="关闭", command=self.close).pack(side="right")
 
-        self._entries: list[dict] = []
-        self.refresh()
+        self.local.refresh()
+        self.remote_pane.refresh()
         self.top.protocol("WM_DELETE_WINDOW", self.close)
 
-    # ------------------------------------------------------------------ actions
+    # ------------------------------------------------------------------ bridge
+    def request_remote(self, path: str) -> None:
+        self.status_var.set("正在请求远端目录…")
+        self.window.commands.put(("list", str(path or "")))
+
     def refresh(self) -> None:
-        self.status_var.set("正在请求目录…")
-        self.window.commands.put(("list", self.path_var.get()))
-
-    def go_up(self) -> None:
-        path = self.path_var.get().strip().rstrip("\\/")
-        parent = os.path.dirname(path)
-        if not parent and len(path) <= 2:  # 已经在盘符根，退回顶层列表
-            parent = ""
-        self.path_var.set(parent)
-        self.refresh()
-
-    def _on_open(self, _event=None) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
-            return
-        entry = self._entries[selection[0]]
-        if entry.get("dir"):
-            base = self.path_var.get().rstrip("\\/")
-            self.path_var.set(f"{base}\\" + str(entry.get("name", "")))
-            self.refresh()
-        else:
-            self.download_selected()
-
-    def download_selected(self) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
-            self.status_var.set("先在列表里选中一个文件")
-            return
-        entry = self._entries[selection[0]]
-        if entry.get("dir"):
-            self.status_var.set("选中的是目录，双击可以进去")
-            return
-        base = self.path_var.get().rstrip("\\/")
-        remote = f"{base}\\" + str(entry.get("name", ""))
-        self.status_var.set(f"正在下载 {remote}")
-        self.window.commands.put(("download", remote))
+        self.local.refresh()
+        self.remote_pane.refresh()
 
     def render(self, payload: dict) -> None:
         error = str(payload.get("error") or "")
         entries = list(payload.get("entries") or [])
         directory = str(payload.get("path") or "")
+        self.remote_pane.show(entries, directory, error)
         if directory:
-            self.path_var.set(directory)
-        self._entries = entries
-        self.listbox.delete(0, "end")
-        for entry in entries:
-            name = str(entry.get("name", ""))
-            if entry.get("dir"):
-                label = f"[{name}]"
-            else:
-                label = f" {name}    {format_size(int(entry.get('size') or 0))}"
-            self.listbox.insert("end", label)
-        if error:
+            self.window.last_remote_dir = directory
+            self.status_var.set(f"远端：{directory} · {len(entries)} 项")
+        elif error:
             self.status_var.set(f"被控端拒绝：{error}")
         else:
-            self.status_var.set(f"{directory or '顶层'} · {len(entries)} 项" + ("（已截断）" if len(entries) >= 500 else ""))
+            self.status_var.set("远端：顶层（选择磁盘）")
+
+    def activate(self, pane: FilePane) -> None:
+        if pane is self.local:
+            self.upload_selected()
+        else:
+            self.download_selected()
+
+    def upload_selected(self) -> None:
+        entry = self.local.selected()
+        if entry is None:
+            self.status_var.set("先在左边选一个本机文件")
+            return
+        if entry.get("dir"):
+            self.status_var.set("选中的是本机目录，双击可以进去")
+            return
+        local_path = self.local.selected_path()
+        remote_dir = self.remote_pane.directory()
+        if not remote_dir:
+            self.status_var.set("右边先选一个远端目录（点 [C:\\] 进去）")
+            return
+        self.status_var.set(f"正在上传 {entry.get('name')} → {remote_dir}")
+        self.window.commands.put(("upload", {"path": local_path, "dir": remote_dir}))
+
+    def download_selected(self) -> None:
+        entry = self.remote_pane.selected()
+        if entry is None:
+            self.status_var.set("先在右边选一个远端文件")
+            return
+        if entry.get("dir"):
+            self.status_var.set("选中的是远端目录，双击可以进去")
+            return
+        remote_path = self.remote_pane.selected_path()
+        self.status_var.set(f"正在下载 {remote_path}")
+        self.window.commands.put(("download", remote_path))
 
     def close(self) -> None:
+        self.window.last_remote_dir = self.remote_pane.directory()
+        self.window.last_local_dir = self.local.directory()
         if getattr(self.window, "remote_dialog", None) is self:
             self.window.remote_dialog = None
         self.top.destroy()
