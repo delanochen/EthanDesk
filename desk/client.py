@@ -121,6 +121,9 @@ class DeskWindow:
             # 和向日葵一样：装好就能被协助，不需要再点一次“开始服务”。
             self.serve_var.set(True)
             self._start_agent()
+        if start_threads and self.viewer_config.password:
+            # 存过口令就自动登录中继，首页不该停在“未登录”让人再点一次。
+            self.root.after(300, self._login)
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
