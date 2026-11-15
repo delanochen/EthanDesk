@@ -23,6 +23,10 @@ def main() -> None:
     root.title("点击靶子")
     root.geometry("240x160+840+460")
     root.configure(background="#1B2430")
+    # 必须置顶：被其它窗口盖住时，远控的点击落在上层窗口上，靶子收不到。
+    root.attributes("-topmost", True)
+    root.lift()
+    root.focus_force()
     label = tk.Label(root, text="等待远端点击…", fg="#E8EEF6", bg="#1B2430",
                      font=("Microsoft YaHei UI", 11))
     label.pack(expand=True)

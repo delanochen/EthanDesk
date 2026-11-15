@@ -40,6 +40,20 @@ RECONNECT_DELAY = 3.0
 # 允许同时在途的未确认帧数，以及应答丢失后的自愈阈值（秒）
 MAX_INFLIGHT = 3
 ACK_TIMEOUT = 2.0
+# 链路停滞阈值：这么久没收到任何消息就主动断开重连。Cloudflare 那条 WebSocket
+# 路径会偶发几十秒不吐数据，aiohttp 不会自己判定超时，agent 会卡在半开连接上，
+# 表现为“进程还在但中继显示离线”。
+STALL_TIMEOUT = 60.0
+# 单次发送/关闭的最长等待，避免发送被卡住时心跳线程一起挂死。
+SEND_TIMEOUT = 15.0
+# 首帧前等主控端下发画面档位的时间。慢链路上 1.0×/q70 的首帧接近 200 KB，光搬
+# 这一帧就要二十多秒，用户看到的却是“连上了但没画面”。
+SETTINGS_GRACE = 3.0
+
+
+def link_stalled(last_rx: float, now: float) -> bool:
+    """True when nothing has arrived for ``STALL_TIMEOUT`` seconds."""
+    return last_rx > 0 and (now - last_rx) > STALL_TIMEOUT
 
 
 class AgentWorker:
@@ -70,6 +84,11 @@ class AgentWorker:
         # 关着的时候一行都不打，开的时候每类事件最多 1 秒一条。
         self._debug_input = bool(os.environ.get("ETHANDESK_DEBUG_INPUT"))
         self._last_input_log = 0.0
+        self._last_rx = 0.0
+        self._settings_event: asyncio.Event | None = None
+        # 上一次主控端实际用过的档位。跨洋链路上 set_quality 可能比会话启动还慢，
+        # 首帧若按本机配置的 1.0×/q70 编码就又把链路堵死；下次会话直接沿用它。
+        self._remote_profile: "tuple[float, int, int] | None" = None
         self._last_capture_error = ""
         self._first_frame_logged = False
         self._connected = False
@@ -162,6 +181,7 @@ class AgentWorker:
                     )
                 )
                 self._emit("status", "connecting")
+                self._last_rx = time.monotonic()
                 heartbeat = asyncio.create_task(self._heartbeat(ws))
                 clip_task = asyncio.create_task(self._clipboard_loop(ws))
                 try:
@@ -179,12 +199,32 @@ class AgentWorker:
                     self._emit("log", "连接已断开")
 
     async def _heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Ping the relay, and force a reconnect when the link goes quiet.
+
+        A stalled Cloudflare path leaves ``async for message in ws`` waiting forever,
+        so the watchdog here is what actually ends a dead connection.
+        """
         try:
             while not ws.closed:
-                await ws.send_str(encode({"t": "ping", "ts": time.time()}))
                 await asyncio.sleep(PING_INTERVAL)
+                if link_stalled(self._last_rx, time.monotonic()):
+                    self._emit("log", f"链路 {STALL_TIMEOUT:.0f}s 无响应，主动重连")
+                    break
+                try:
+                    await asyncio.wait_for(
+                        ws.send_str(encode({"t": "ping", "ts": time.time()})), SEND_TIMEOUT
+                    )
+                except (asyncio.TimeoutError, ConnectionResetError, RuntimeError):
+                    self._emit("log", "心跳发送超时，主动重连")
+                    break
         except (ConnectionResetError, asyncio.CancelledError):
             pass
+        finally:
+            if not ws.closed:
+                try:
+                    await asyncio.wait_for(ws.close(), SEND_TIMEOUT)
+                except (asyncio.TimeoutError, ConnectionResetError, RuntimeError):
+                    pass
 
     async def _clipboard_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         try:
@@ -209,6 +249,7 @@ class AgentWorker:
     async def _handle_message(
         self, ws: aiohttp.ClientWebSocketResponse, message: aiohttp.WSMessage
     ) -> None:
+        self._last_rx = time.monotonic()
         if message.type == aiohttp.WSMsgType.TEXT:
             try:
                 decoded = decode(message.data)
@@ -273,6 +314,9 @@ class AgentWorker:
                 scale=message.get("scale", self._scale),
                 fps=message.get("fps", self._fps),
             )
+            self._remote_profile = (self._scale, self._quality, self._fps)
+            if self._settings_event is not None:
+                self._settings_event.set()
             return
         if kind == "frame_recv":
             self._inflight = max(0, self._inflight - 1)
@@ -393,6 +437,11 @@ class AgentWorker:
             self._emit("log", f"保存配置失败：{exc}")
 
     async def _on_session_start(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        self._settings_event = asyncio.Event()
+        # 每个会话都记一次首帧，便于按会话排查“连上了但没画面”。
+        self._first_frame_logged = False
+        if self._remote_profile is not None:
+            self._scale, self._quality, self._fps = self._remote_profile
         if self._capturer is not None:
             await ws.send_str(
                 encode(
@@ -428,6 +477,12 @@ class AgentWorker:
             self._emit("log", "抓屏不可用：capturer 未初始化")
             return
         sequence = 0
+        settings_event = self._settings_event
+        if settings_event is not None and not settings_event.is_set():
+            try:
+                await asyncio.wait_for(settings_event.wait(), SETTINGS_GRACE)
+            except asyncio.TimeoutError:
+                pass
         try:
             while not ws.closed and self._active_session:
                 if self._inflight >= MAX_INFLIGHT:
