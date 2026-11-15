@@ -19,10 +19,13 @@ import os
 import sys
 
 from common.defaults import DEFAULT_VIEWER_URL
+from common.keys import text_for_key
 from viewer.client import DeskClient
 
 PASSWORD = os.environ.get("ETHANDESK_RELAY_PASSWORD", "")
 LONG = "ABCDEFGHIJ" * 30  # 300 个字符，验证长文本不被截断
+SHIFT = 0x0001
+CONTROL = 0x0004
 
 
 async def main() -> None:
@@ -49,10 +52,23 @@ async def main() -> None:
         await key(keysym, False)
         await asyncio.sleep(0.12)
 
-    async def combo(modifier: str, keysym: str) -> None:
+    async def press(char: str, keysym: str, state: int = 0) -> None:
+        """按主控端的分流发一次按键：可打印字符走字符注入，其余走虚拟键。
+
+        和 viewer/app.py、desk/client.py 里的 _on_key 是同一条规则（common.keys
+        的 text_for_key），所以这里测到的就是 GUI 真实会发出去的消息。
+        """
+        text = text_for_key(char, state)
+        if text:
+            await session.send_text({"t": "input", "ev": "text", "text": text})
+            await asyncio.sleep(0.12)
+        else:
+            await tap(keysym)
+
+    async def combo(modifier: str, char: str, keysym: str) -> None:
         await key(modifier, True)
         await asyncio.sleep(0.15)
-        await tap(keysym)
+        await press(char, keysym, CONTROL if modifier == "Control_L" else SHIFT)
         await key(modifier, False)
         await asyncio.sleep(0.15)
 
@@ -70,17 +86,17 @@ async def main() -> None:
         await asyncio.sleep(0.8)
 
         print("STEP lowercase: keysym a", flush=True)
-        await tap("a")
+        await press("a", "a")
 
         print("STEP Shift+A -> expect uppercase A", flush=True)
-        await combo("Shift_L", "A")
+        await combo("Shift_L", "A", "A")
 
         print("STEP comma + Shift+1 -> expect comma then !", flush=True)
-        await tap("comma")
-        await combo("Shift_L", "exclam")
+        await press(",", "comma")
+        await combo("Shift_L", "!", "exclam")
 
         print("STEP Ctrl+A then Z -> content should become Z", flush=True)
-        await combo("Control_L", "a")
+        await combo("Control_L", "a", "a")
         await asyncio.sleep(0.2)
         await session.send_text({"t": "input", "ev": "text", "text": "Z"})
         await asyncio.sleep(0.4)
@@ -94,7 +110,7 @@ async def main() -> None:
         await asyncio.sleep(0.6)
 
         print("STEP Ctrl+A then BackSpace -> content should be empty", flush=True)
-        await combo("Control_L", "a")
+        await combo("Control_L", "a", "a")
         await asyncio.sleep(0.2)
         await tap("BackSpace")
 

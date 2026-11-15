@@ -90,11 +90,33 @@ _SHIFTED_DIGITS: dict[str, int] = {
 }
 
 
+# Tk 的 state 里这三位分别代表 Ctrl、Alt(Mod1)、Win(Mod4)。带这些修饰键的按键要
+# 继续走虚拟键，否则 Ctrl+C / Ctrl+V 这种快捷键就没有了。
+_MODIFIER_STATE_BITS = 0x0004 | 0x0008 | 0x0040
+
+
+def text_for_key(char: str, state: int) -> str | None:
+    """判断这次按键该不该按字符注入，返回要注入的文本（不该就是 None）。
+
+    可打印字符一律按字符注入（``KEYEVENTF_UNICODE``），不走虚拟键。这样远端处于
+    中文输入法的组字状态、或者 CapsLock 开着，落下来的也还是主控端打的那个字符 ——
+    真机上就踩到过：远端微软拼音一开，虚拟键变成了拼音候选，输入框一个字都没进。
+
+    Ctrl/Alt/Win 组合键、回车/Tab/退格这类控制字符仍然交回虚拟键路径。
+    """
+    if not char or len(char) != 1:
+        return None
+    if state & _MODIFIER_STATE_BITS:
+        return None
+    if ord(char) < 0x20:
+        return None
+    return char
+
+
 def keysym_to_vk(keysym: str) -> int | None:
     """Translate a Tk keysym into a Win32 virtual-key code."""
     if not keysym:
         return None
-
     if len(keysym) == 1:
         char = keysym
         if "a" <= char <= "z":

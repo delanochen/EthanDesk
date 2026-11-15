@@ -1,4 +1,38 @@
-from common.keys import keysym_to_vk
+from common.keys import keysym_to_vk, text_for_key
+
+SHIFT = 0x0001
+CONTROL = 0x0004
+ALT = 0x0008
+WIN = 0x0040
+
+
+def test_printable_characters_go_through_text_injection():
+    assert text_for_key("a", 0) == "a"
+    assert text_for_key("7", 0) == "7"
+    # Shift 只是大小写，仍按字符注入：远端 CapsLock 状态不会把大小写弄反。
+    assert text_for_key("A", SHIFT) == "A"
+    assert text_for_key("!", SHIFT) == "!"
+
+
+def test_non_ascii_also_goes_through_text_injection():
+    assert text_for_key("中", 0) == "中"
+    assert text_for_key("😀", 0) == "😀"
+
+
+def test_control_combinations_stay_on_the_virtual_key_path():
+    # Ctrl+C / Ctrl+V 这类快捷键必须还是按键，否则复制粘贴就没了。
+    assert text_for_key("c", CONTROL) is None
+    assert text_for_key("v", CONTROL) is None
+    assert text_for_key("a", ALT) is None
+    assert text_for_key("d", WIN) is None
+
+
+def test_non_printable_and_empty_are_not_text():
+    assert text_for_key("\r", 0) is None
+    assert text_for_key("\t", 0) is None
+    assert text_for_key("\x08", 0) is None
+    assert text_for_key("", 0) is None
+    assert text_for_key("ab", 0) is None
 
 
 def test_letters_are_uppercase_vk_codes():

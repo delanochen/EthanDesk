@@ -850,15 +850,20 @@ class DeskWindow:
         )
 
     def _on_key(self, event, pressed: bool) -> None:
+        from common.keys import text_for_key
+
         keysym = getattr(event, "keysym", "")
         if not keysym:
             return
-        # 非 ASCII 字符（中文/日文/emoji）没有可翻译的虚拟键，改走文本注入：
-        # 远端按字符本身落字，不依赖它那边的键盘布局或输入法。
+        # 可打印字符（含中文/日文/emoji）按字符注入：远端输入法正在组字、或者
+        # CapsLock 开着，落下来的也还是主控端打的那个字符。Ctrl/Alt 组合键仍走
+        # 虚拟键，否则复制粘贴就没有了。
         char = getattr(event, "char", "") or ""
-        if pressed and len(char) == 1 and ord(char) > 0x7E:
-            self.viewer_commands.put(("input", {"t": "input", "ev": "text", "text": char}))
-            return
+        if pressed:
+            text = text_for_key(char, int(getattr(event, "state", 0) or 0))
+            if text:
+                self.viewer_commands.put(("input", {"t": "input", "ev": "text", "text": text}))
+                return
         self.viewer_commands.put(
             ("input", {"t": "input", "ev": "key_down" if pressed else "key_up", "keysym": keysym})
         )
