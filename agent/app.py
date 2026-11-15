@@ -511,7 +511,12 @@ class AgentWorker:
                         self._emit("log", message)
                     await asyncio.sleep(0.5)
                     continue
-                self._last_capture_error = ""
+                # 兜底抓屏生效/恢复都给主控端留一条记录，别让画面来源悄悄变了。
+                note = str(getattr(capturer, "last_note", ""))
+                if note != self._last_capture_error:
+                    self._last_capture_error = note
+                    if note:
+                        self._emit("log", note)
                 header = make_bin_header(
                     "frame", seq=sequence, size=len(payload), width=width, height=height
                 )
