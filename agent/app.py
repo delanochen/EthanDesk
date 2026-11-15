@@ -49,6 +49,9 @@ SEND_TIMEOUT = 15.0
 # 首帧前等主控端下发画面档位的时间。慢链路上 1.0×/q70 的首帧接近 200 KB，光搬
 # 这一帧就要二十多秒，用户看到的却是“连上了但没画面”。
 SETTINGS_GRACE = 3.0
+# 主控端能远程取走的单个文件上限。整份读进内存再分块发，超过这个尺寸先把请求拒掉，
+# 免得被一个大文件把被控端进程撑爆。
+MAX_PULL_BYTES = 512 * 1024 * 1024
 
 
 def link_stalled(last_rx: float, now: float) -> bool:
@@ -336,6 +339,9 @@ class AgentWorker:
         if kind == "file_offer":
             self._open_incoming(message)
             return
+        if kind == "file_get":
+            await self._serve_get(ws, message)
+            return
         if kind == "bin":
             self._pairer.header(message)
             return
@@ -545,6 +551,16 @@ class AgentWorker:
         asyncio.run_coroutine_threadsafe(self._send_file(path), loop)
 
     async def _send_file(self, path: str) -> None:
+        ws = getattr(self, "_ws", None)
+        if ws is None or ws.closed:
+            self._emit("log", "会话未激活，无法发送文件")
+            return
+        await self._push_file(ws, path)
+
+    async def _push_file(
+        self, ws: aiohttp.ClientWebSocketResponse, path: str, *, reason: str = ""
+    ) -> None:
+        """Read one file and stream it to the viewer as a ``direction="down"`` offer."""
         try:
             with open(path, "rb") as handle:
                 data = handle.read()
@@ -554,8 +570,7 @@ class AgentWorker:
         if not self._connected:
             self._emit("log", "未连接，无法发送文件")
             return
-        ws = getattr(self, "_ws", None)
-        if ws is None or ws.closed:
+        if ws.closed:
             self._emit("log", "会话未激活，无法发送文件")
             return
         outgoing = OutgoingFile(uuid_hex(), os.path.basename(path), data, direction="down")
@@ -563,7 +578,49 @@ class AgentWorker:
         for header, chunk in outgoing.frames():
             await ws.send_str(encode(header))
             await ws.send_bytes(chunk)
-        self._emit("log", f"已发送文件：{os.path.basename(path)}")
+        prefix = f"{reason}：" if reason else ""
+        self._emit("log", f"{prefix}已发送文件 {os.path.basename(path)}（{len(data)} bytes）")
+
+    def resolve_pull_path(self, raw: str) -> tuple[str | None, str]:
+        """Validate a viewer-supplied path for a remote pull.
+
+        Returns ``(path, "")`` when the request may proceed, otherwise ``(None, reason)``
+        with a message meant for the viewer log. Only absolute paths to a single regular
+        file inside the size cap are accepted; there is no directory packing yet, so a
+        directory request is refused explicitly instead of silently doing nothing.
+        """
+        text = str(raw or "").strip().strip('"').strip("'")
+        if not text:
+            return None, "取文件请求缺少路径"
+        if "~" in text or "%" in text:
+            text = os.path.expandvars(os.path.expanduser(text))
+        if not os.path.isabs(text):
+            return None, f"只接受绝对路径：{raw}"
+        if os.path.isdir(text):
+            return None, f"暂不支持下载整个目录：{raw}"
+        if not os.path.isfile(text):
+            return None, f"文件不存在或不是普通文件：{raw}"
+        try:
+            size = os.path.getsize(text)
+        except OSError as exc:
+            return None, f"读取文件大小失败：{exc}"
+        if size > MAX_PULL_BYTES:
+            return None, (
+                f"文件太大（{size} bytes，上限 {MAX_PULL_BYTES} bytes）：{raw}"
+            )
+        return text, ""
+
+    async def _serve_get(
+        self, ws: aiohttp.ClientWebSocketResponse, message: dict
+    ) -> None:
+        if not self._active_session:
+            self._emit("log", "没有活动会话，已拒绝远端取文件请求")
+            return
+        path, reason = self.resolve_pull_path(str(message.get("path", "")))
+        if path is None:
+            self._emit("log", f"远端取文件被拒绝：{reason}")
+            return
+        await self._push_file(ws, path, reason="远端取文件")
 
     def _open_incoming(self, message: dict) -> None:
         transfer_id = str(message.get("id", ""))

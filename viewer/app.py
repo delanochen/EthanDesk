@@ -77,6 +77,7 @@ class ViewerWorker:
         self._last_clip = ""
         self._clip_enabled = False
         self._connected_agent = ""
+        self._last_remote_path = ""
         self.download_dir = DEFAULT_DOWNLOAD_DIR
         # Picture profile in force. It starts at the neutral profile the agent defaults to
         # and is lowered window by window while auto quality is on.
@@ -162,6 +163,9 @@ class ViewerWorker:
             elif action == "upload" and self._session is not None:
                 path = payload.get("path", "") if isinstance(payload, dict) else payload
                 await self._upload(str(path))
+            elif action == "download" and self._session is not None:
+                path = payload.get("path", "") if isinstance(payload, dict) else payload
+                await self._request_download(str(path))
             elif action == "clip" and self._session is not None:
                 await self._session.send_text({"t": "clip", "dir": "to_agent", "text": str(payload)})
             elif action == "set_clipboard_sync":
@@ -422,6 +426,19 @@ class ViewerWorker:
             await session.send_bin(header, chunk)
         self._emit("log", f"已上传：{os.path.basename(path)}")
 
+    async def _request_download(self, remote_path: str) -> None:
+        """Ask the agent for a file; the agent answers with a direction="down" offer."""
+        session = self._session
+        if session is None:
+            return
+        path = str(remote_path or "").strip().strip('"')
+        if not path:
+            self._emit("error", "远程路径为空")
+            return
+        self._last_remote_path = path
+        await session.send_text({"t": "file_get", "path": path})
+        self._emit("log", f"已请求下载 {os.path.basename(path)}")
+
     async def _clipboard_loop(self) -> None:
         try:
             while True:
@@ -654,6 +671,7 @@ class ViewerWindow:
         bar.pack(fill="x")
         ttk.Button(bar, text="断开", command=self._disconnect).pack(side="left")
         ttk.Button(bar, text="上传文件…", command=self._pick_upload).pack(side="left", padx=8)
+        ttk.Button(bar, text="下载远程文件…", command=self._pick_download).pack(side="left")
         ttk.Checkbutton(bar, text="剪贴板同步", variable=self.clip_var,
                         command=self._toggle_clipboard).pack(side="left", padx=12)
         ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
@@ -876,6 +894,22 @@ class ViewerWindow:
         path = filedialog.askopenfilename(title="选择要上传到被控端的文件")
         if path:
             self.commands.put(("upload", path))
+
+    def _pick_download(self) -> None:
+        from tkinter import simpledialog
+
+        last = getattr(self, "_last_remote_path", "") or "C:\\"
+        path = simpledialog.askstring(
+            "下载远程文件",
+            "被控端文件的完整路径（例如 C:\\Users\\admin\\Desktop\\报告.docx）",
+            initialvalue=last,
+            parent=self.root,
+        )
+        if not path:
+            return
+        self._last_remote_path = path
+        self.status_var.set(f"正在向被控端请求 {path}")
+        self.commands.put(("download", path))
 
     # ---------------------------------------------------------------- input
     def _frame_norm(self, event_x: float, event_y: float) -> tuple[float, float]:
