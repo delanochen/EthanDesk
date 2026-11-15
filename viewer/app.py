@@ -38,6 +38,11 @@ ADAPT_MAX_QUALITY = 85
 ADAPT_LOW_FPS = 3.0
 ADAPT_HIGH_FPS = 14.0
 
+# 主控端断线重连：会话不是用户主动断开时，隔一小会儿自动重连，失败则退避加倍。
+# 被控端重启只要几秒，所以首次间隔取小值；退避上限防止长时间空转。
+VIEWER_RECONNECT_DELAY = 2.0
+VIEWER_RECONNECT_MAX_DELAY = 20.0
+
 
 def next_video_profile(profile: dict, fps: float) -> dict | None:
     """AweSun-style auto quality: trade sharpness for frame rate on a slow link."""
@@ -78,6 +83,12 @@ class ViewerWorker:
         self._video: dict[str, float] = {"quality": 70, "scale": 1.0, "fps": 15}
         self._auto_quality = bool(ViewerConfig.load().auto_quality)
         self._frames_window = 0
+        # Reconnect bookkeeping: remember the last session we opened, and whether the
+        # close was the user's own doing (断开) or a fault the viewer should heal itself.
+        self._reconnect_agent = ""
+        self._reconnect_code = ""
+        self._manual_disconnect = False
+        self._reconnect_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -130,6 +141,9 @@ class ViewerWorker:
             elif action == "connect":
                 await self._connect(payload)
             elif action == "disconnect":
+                self._manual_disconnect = True
+                self._cancel_reconnect()
+                self._reconnect_agent = ""
                 await self._teardown()
             elif action == "input" and self._session is not None:
                 await self._session.send_text(payload)
@@ -238,6 +252,10 @@ class ViewerWorker:
         if not agent_id:
             self._emit("error", "缺少设备 ID")
             return
+        self._cancel_reconnect()
+        self._manual_disconnect = False
+        self._reconnect_agent = agent_id
+        self._reconnect_code = code
         await self._teardown()
         self._emit("status", f"正在连接 {agent_id}…")
         session = await self._client.open_session(agent_id, code)
@@ -270,6 +288,54 @@ class ViewerWorker:
             if self._session is session:
                 self._session = None
             self._emit("session_closed", self._connected_agent)
+            if self._should_reconnect():
+                self._schedule_reconnect()
+
+    # ------------------------------------------------------------ reconnect
+    def _should_reconnect(self) -> bool:
+        """Self-heal a dropped session unless the user closed it on purpose."""
+        return not self._stopping and not self._manual_disconnect and bool(self._reconnect_agent)
+
+    def _cancel_reconnect(self) -> None:
+        task = self._reconnect_task
+        self._reconnect_task = None
+        # Never cancel the coroutine that is calling us: a successful reconnect happens
+        # inside the reconnect loop itself.
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _schedule_reconnect(self) -> None:
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        if self._loop is None:
+            return
+        self._reconnect_task = self._loop.create_task(self._reconnect_loop())
+
+    async def _reconnect_loop(self) -> None:
+        delay = VIEWER_RECONNECT_DELAY
+        attempt = 0
+        try:
+            while self._should_reconnect():
+                attempt += 1
+                self._emit("status", f"连接已断开，{delay:.0f} 秒后重连（第 {attempt} 次）")
+                self._emit("log", f"连接已断开，{delay:.0f} 秒后自动重连")
+                await asyncio.sleep(delay)
+                if not self._should_reconnect():
+                    return
+                agent_id = self._reconnect_agent
+                try:
+                    await self._connect({"agent_id": agent_id, "code": self._reconnect_code})
+                except DeskClientError as exc:
+                    self._emit("log", f"重连未成功：{exc}")
+                    delay = min(delay * 1.5, VIEWER_RECONNECT_MAX_DELAY)
+                    continue
+                self._emit("log", "已自动重连，画面恢复")
+                return
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
 
     async def _handle_text(self, message: dict) -> None:
         kind = message.get("t")
