@@ -30,7 +30,7 @@ class ViewerConfig:
     relay_url: str = DEFAULT_VIEWER_URL
     password: str = ""
     # Trade resolution/quality for frame rate on a slow link instead of pinning the user's profile.
-    auto_quality: bool = False
+    auto_quality: bool = True
 
     @classmethod
     def load(cls, path: str = "") -> "ViewerConfig":

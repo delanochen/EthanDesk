@@ -11,6 +11,7 @@ from viewer.app import (
     ADAPT_MAX_QUALITY,
     ADAPT_MIN_QUALITY,
     ADAPT_MIN_SCALE,
+    ViewerWorker,
     next_video_profile,
 )
 
@@ -30,110 +31,96 @@ def _quality_messages(session: _StubSession) -> list[dict]:
     return [m for m in session.sent if m.get("t") == "set_quality"]
 
 
-def test_slow_link_drops_quality_before_resolution():
-    scale, quality = next_video_profile(0.5, 1.0, 70, 1.0, 70)
-    assert quality == 60
-    assert scale == 1.0
+def _worker() -> ViewerWorker:
+    return ViewerWorker(queue.Queue(), queue.Queue())
 
 
-def test_quality_floor_then_scale_drops():
-    scale, quality = next_video_profile(0.0, 1.0, ADAPT_MIN_QUALITY, 1.0, 70)
-    assert quality == ADAPT_MIN_QUALITY
-    assert scale == 0.95
+def test_slow_link_drops_scale_and_quality_together():
+    updated = next_video_profile({"quality": 70, "scale": 1.0, "fps": 15}, fps=1.2)
+    assert updated is not None
+    assert updated["scale"] == 0.85
+    assert updated["quality"] == 62
 
 
-def test_never_below_scale_floor():
-    scale, quality = next_video_profile(0.0, ADAPT_MIN_SCALE, ADAPT_MIN_QUALITY, 1.0, 70)
-    assert scale == ADAPT_MIN_SCALE
-    assert quality == ADAPT_MIN_QUALITY
+def test_scale_never_goes_below_the_floor():
+    profile = {"quality": ADAPT_MIN_QUALITY, "scale": ADAPT_MIN_SCALE + 0.05, "fps": 15}
+    updated = next_video_profile(profile, fps=0.5)
+    assert updated is not None
+    assert updated["scale"] == ADAPT_MIN_SCALE
 
 
-def test_dead_link_stops_at_floors():
-    """No frames at all: repeated windows must park at the floor, not go negative."""
-    scale, quality = ADAPT_MIN_SCALE, ADAPT_MIN_QUALITY
+def test_dead_link_parks_at_the_floor():
+    """No frames at all: repeated windows must park, not go negative."""
+    profile = {"quality": 70, "scale": 1.0, "fps": 15}
     for _ in range(20):
-        scale, quality = next_video_profile(0.0, scale, quality, 1.0, 70)
-    assert (scale, quality) == (ADAPT_MIN_SCALE, ADAPT_MIN_QUALITY)
+        updated = next_video_profile(profile, fps=0.0)
+        if updated is None:
+            break
+        profile = updated
+    assert profile["scale"] == ADAPT_MIN_SCALE
+    assert profile["quality"] >= ADAPT_MIN_QUALITY
+    assert next_video_profile(profile, fps=0.0) is None
 
 
-def test_fast_link_climbs_scale_back_first():
-    scale, quality = next_video_profile(ADAPT_HIGH_FPS, 0.6, ADAPT_MIN_QUALITY, 1.0, 70)
-    assert scale == 0.65
-    assert quality == ADAPT_MIN_QUALITY
-
-
-def test_fast_link_then_raises_quality_to_ceiling():
-    scale, quality = next_video_profile(ADAPT_HIGH_FPS, 1.0, 60, 1.0, 70)
-    assert scale == 1.0
-    assert quality == 70
-
-
-def test_never_exceeds_user_profile():
-    scale, quality = next_video_profile(ADAPT_HIGH_FPS, 1.0, 70, 1.0, 70)
-    assert (scale, quality) == (1.0, 70)
+def test_fast_link_climbs_scale_back():
+    updated = next_video_profile({"quality": 45, "scale": 0.6, "fps": 15}, fps=15.0)
+    assert updated is not None
+    assert updated["scale"] == 0.7
+    assert updated["quality"] == 50
 
 
 def test_quality_ceiling_is_capped_at_85():
-    scale, quality = next_video_profile(ADAPT_HIGH_FPS, 1.0, 85, 1.0, 95)
-    assert quality == ADAPT_MAX_QUALITY
+    updated = next_video_profile({"quality": 84, "scale": 0.95, "fps": 15}, fps=15.0)
+    assert updated is not None
+    assert updated["quality"] == ADAPT_MAX_QUALITY
 
 
 def test_mid_band_is_left_alone():
     """Between the low and high thresholds a marginal link must not oscillate."""
     midpoint = (ADAPT_LOW_FPS + ADAPT_HIGH_FPS) / 2
-    assert next_video_profile(midpoint, 0.8, 55, 1.0, 70) == (0.8, 55)
+    assert next_video_profile({"quality": 55, "scale": 0.8, "fps": 15}, fps=midpoint) is None
 
 
-def test_low_profile_floor_follows_base():
-    """A user who already asked for 0.4× is not pushed below their own setting."""
-    scale, quality = next_video_profile(0.0, 0.4, 35, 0.4, 45)
-    assert scale == 0.4
-    assert quality == 35
-
-
-def test_worker_sends_base_profile_then_adapts_it():
-    worker_session = queue.Queue()
-    worker = __import__("viewer.app", fromlist=["ViewerWorker"]).ViewerWorker(
-        queue.Queue(), worker_session
-    )
+def test_worker_sends_the_cached_profile_on_connect():
+    worker = _worker()
+    worker._remember_settings({"quality": 55, "scale": 0.75, "fps": 10})
     stub = _StubSession()
     worker._session = stub
-    asyncio.run(worker._dispatch(("settings", {"quality": 70, "scale": 1.0, "fps": 15})))
-    assert _quality_messages(stub)[-1] == {"t": "set_quality", "scale": 1.0, "quality": 70, "fps": 15}
-
-    asyncio.run(worker._dispatch(("auto_quality", True)))
-    assert worker._auto_quality is True
-
-    asyncio.run(worker._dispatch(("settings", {"quality": 60, "scale": 1.0, "fps": 15})))
-    assert _quality_messages(stub)[-1]["quality"] == 60
+    asyncio.run(worker._dispatch(("settings", {"quality": 55, "scale": 0.75, "fps": 10})))
+    assert _quality_messages(stub)[-1] == {
+        "t": "set_quality", "quality": 55, "scale": 0.75, "fps": 10
+    }
 
 
-def test_worker_turning_auto_off_restores_user_profile():
-    worker = __import__("viewer.app", fromlist=["ViewerWorker"]).ViewerWorker(
-        queue.Queue(), queue.Queue()
-    )
-    stub = _StubSession()
-    worker._session = stub
-    asyncio.run(worker._dispatch(("settings", {"quality": 70, "scale": 1.0, "fps": 15})))
-    asyncio.run(worker._dispatch(("auto_quality", True)))
-    worker._eff_scale, worker._eff_quality = ADAPT_MIN_SCALE, ADAPT_MIN_QUALITY
-    asyncio.run(worker._dispatch(("auto_quality", False)))
-    assert (worker._eff_scale, worker._eff_quality) == (1.0, 70)
-    assert _quality_messages(stub)[-1]["quality"] == 70
+def test_manual_settings_switch_auto_quality_off():
+    worker = _worker()
+    asyncio.run(worker._dispatch(("settings", {"quality": 60, "scale": 0.8, "fps": 10})))
+    assert worker._auto_quality is False
+    assert worker._video == {"quality": 60, "scale": 0.8, "fps": 10}
 
 
 def test_worker_flips_auto_even_without_session():
-    worker = __import__("viewer.app", fromlist=["ViewerWorker"]).ViewerWorker(
-        queue.Queue(), queue.Queue()
-    )
+    worker = _worker()
     asyncio.run(worker._dispatch(("auto_quality", True)))
     assert worker._auto_quality is True
 
 
+def test_delivered_frames_are_counted_for_the_adapt_window():
+    """The loop must read frames actually delivered; a counter that never moves reads as 0 fps."""
+    worker = _worker()
+
+    class _Pairer:
+        def attach(self, data):
+            return {"kind": "frame"}, b"jpeg"
+
+    worker._pairer = _Pairer()
+    for _ in range(3):
+        worker._handle_binary(b"x")
+    assert worker._frames_window == 3
+
+
 def test_upload_accepts_dict_and_plain_path(tmp_path):
-    worker = __import__("viewer.app", fromlist=["ViewerWorker"]).ViewerWorker(
-        queue.Queue(), queue.Queue()
-    )
+    worker = _worker()
     stub = _StubSession()
     worker._session = stub
     sample = tmp_path / "note.txt"

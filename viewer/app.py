@@ -27,54 +27,34 @@ AGENT_REFRESH = 5.0
 CLIPBOARD_POLL = 0.6
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "deskrelay")
 
-# Adaptive picture control (自适应画质). A link that cannot move the user's profile has to
-# trade sharpness for frame rate, otherwise the picture is unusable even though nothing is
-# broken. The low and high thresholds are deliberately far apart: a marginal link sits
-# between them and must not oscillate on every window.
+# Adaptive picture control (自适应画质): trade sharpness for frame rate on a slow link.
+# The low and high thresholds are deliberately far apart, so a marginal link sits between
+# them instead of oscillating on every measurement window.
 ADAPT_WINDOW = 4.0
 ADAPT_MIN_SCALE = 0.5
 ADAPT_MIN_QUALITY = 35
 ADAPT_MAX_QUALITY = 85
 ADAPT_LOW_FPS = 3.0
 ADAPT_HIGH_FPS = 14.0
-ADAPT_QUALITY_STEP = 10
-ADAPT_SCALE_STEP = 0.05
 
 
-def next_video_profile(
-    fps: float,
-    scale: float,
-    quality: int,
-    base_scale: float,
-    base_quality: int,
-) -> "tuple[float, int]":
-    """Return the (scale, quality) for the next window given what the link just managed.
-
-    Quality is spent first - at a fixed frame size it is the cheapest knob in bytes per
-    unit of clarity - and resolution only after quality is at the floor. Recovery climbs
-    resolution back before quality, so a recovering link regains readability first.
-    The user's own profile (``base_*``) is the ceiling: adaptation never makes the picture
-    better than what was asked for.
-    """
-    floor_quality = min(ADAPT_MIN_QUALITY, int(base_quality))
-    ceiling_quality = min(ADAPT_MAX_QUALITY, int(base_quality))
-    floor_scale = min(ADAPT_MIN_SCALE, float(base_scale))
-    ceiling_scale = float(base_scale)
-
-    scale = max(floor_scale, min(ceiling_scale, float(scale)))
-    quality = max(floor_quality, min(ceiling_quality, int(quality)))
-
-    if fps <= 0 or fps < ADAPT_LOW_FPS:
-        if quality > floor_quality:
-            quality = max(floor_quality, quality - ADAPT_QUALITY_STEP)
-        elif scale > floor_scale:
-            scale = max(floor_scale, round(scale - ADAPT_SCALE_STEP, 3))
-    elif fps >= ADAPT_HIGH_FPS:
-        if scale < ceiling_scale:
-            scale = min(ceiling_scale, round(scale + ADAPT_SCALE_STEP, 3))
-        elif quality < ceiling_quality:
-            quality = min(ceiling_quality, quality + ADAPT_QUALITY_STEP)
-    return round(scale, 3), quality
+def next_video_profile(profile: dict, fps: float) -> dict | None:
+    """AweSun-style auto quality: trade sharpness for frame rate on a slow link."""
+    scale = float(profile.get("scale", 1.0))
+    quality = int(profile.get("quality", 70))
+    if fps < ADAPT_LOW_FPS and scale > ADAPT_MIN_SCALE:
+        return {
+            **profile,
+            "scale": max(ADAPT_MIN_SCALE, round(scale - 0.15, 3)),
+            "quality": max(ADAPT_MIN_QUALITY, quality - 8),
+        }
+    if fps > ADAPT_HIGH_FPS and scale < 1.0:
+        return {
+            **profile,
+            "scale": min(1.0, round(scale + 0.1, 3)),
+            "quality": min(ADAPT_MAX_QUALITY, quality + 5),
+        }
+    return None
 
 
 class ViewerWorker:
@@ -92,15 +72,11 @@ class ViewerWorker:
         self._clip_enabled = False
         self._connected_agent = ""
         self.download_dir = DEFAULT_DOWNLOAD_DIR
-        # Picture profile: base is what the user asked for, effective is what is in force
-        # right now (adaptation only ever lowers it, and only while auto_quality is on).
+        # Picture profile in force. It starts at the neutral profile the agent defaults to
+        # and is lowered window by window while auto quality is on.
+        self._video: dict[str, float] = {"quality": 70, "scale": 1.0, "fps": 15}
         self._auto_quality = bool(ViewerConfig.load().auto_quality)
-        self._base_quality = 70
-        self._base_scale = 1.0
-        self._base_fps = 15
-        self._eff_quality = self._base_quality
-        self._eff_scale = self._base_scale
-        self._frame_times: "list[float]" = []
+        self._frames_window = 0
 
     # ---------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -151,7 +127,7 @@ class ViewerWorker:
             elif action == "refresh_sessions":
                 await self._list_sessions()
             elif action == "connect":
-                await self._connect(str(payload))
+                await self._connect(payload)
             elif action == "disconnect":
                 await self._teardown()
             elif action == "input" and self._session is not None:
@@ -159,13 +135,14 @@ class ViewerWorker:
             elif action == "frame_recv" and self._session is not None:
                 await self._session.send_text({"t": "frame_recv"})
             elif action == "settings":
-                self._remember_base(payload)
+                self._remember_settings(payload)
+                self._emit("auto_quality", self._auto_quality)
                 if self._session is not None:
-                    await self._session.send_text({"t": "set_quality", **self._effective_payload()})
+                    await self._session.send_text({"t": "set_quality", **self._video})
             elif action == "auto_quality":
-                self._set_auto_quality(bool(payload))
+                self._auto_quality = bool(payload)
                 if self._session is not None:
-                    await self._session.send_text({"t": "set_quality", **self._effective_payload()})
+                    await self._session.send_text({"t": "set_quality", **self._video})
                 self._emit("auto_quality", self._auto_quality)
             elif action == "upload" and self._session is not None:
                 path = payload.get("path", "") if isinstance(payload, dict) else payload
@@ -182,54 +159,36 @@ class ViewerWorker:
             self._emit("error", f"内部错误：{exc!r}")
 
     # ------------------------------------------------------------- picture profile
-    def _remember_base(self, payload: dict) -> None:
-        """Take the user's own picture profile, and restart adaptation from it."""
-        try:
-            self._base_quality = int(payload.get("quality", self._base_quality))
-            self._base_scale = float(payload.get("scale", self._base_scale))
-            self._base_fps = int(payload.get("fps", self._base_fps))
-        except (TypeError, ValueError, AttributeError):
+    def _remember_settings(self, payload) -> None:
+        if not isinstance(payload, dict):
             return
-        self._eff_quality = self._base_quality
-        self._eff_scale = self._base_scale
-
-    def _effective_payload(self) -> dict:
-        return {"scale": self._eff_scale, "quality": self._eff_quality, "fps": self._base_fps}
-
-    def _set_auto_quality(self, enabled: bool) -> None:
-        self._auto_quality = bool(enabled)
-        if not self._auto_quality:
-            self._eff_quality = self._base_quality
-            self._eff_scale = self._base_scale
-            self._frame_times = []
-
-    def _frame_tick(self) -> None:
-        now = time.time()
-        self._frame_times.append(now)
-        cutoff = now - ADAPT_WINDOW
-        if self._frame_times and self._frame_times[0] < cutoff:
-            self._frame_times = [stamp for stamp in self._frame_times if stamp >= cutoff]
+        for key in ("quality", "scale", "fps"):
+            if key in payload:
+                self._video[key] = payload[key]
+        # A manual choice wins: stop the auto-quality loop from overriding it.
+        self._auto_quality = False
 
     async def _adapt_loop(self) -> None:
-        """On every window, lower the picture if the link is too slow and climb back when it is not."""
+        """Watch the delivered frame rate and shrink the picture when the link is slow."""
         try:
             while True:
                 await asyncio.sleep(ADAPT_WINDOW)
-                session = self._session
-                if not self._auto_quality or session is None:
-                    self._frame_times = []
+                if not self._auto_quality or self._session is None:
+                    self._frames_window = 0
                     continue
-                now = time.time()
-                self._frame_times = [stamp for stamp in self._frame_times if stamp >= now - ADAPT_WINDOW]
-                fps = len(self._frame_times) / ADAPT_WINDOW
-                scale, quality = next_video_profile(
-                    fps, self._eff_scale, self._eff_quality, self._base_scale, self._base_quality
+                fps = self._frames_window / ADAPT_WINDOW
+                self._frames_window = 0
+                updated = next_video_profile(self._video, fps)
+                if updated is None:
+                    continue
+                self._video = updated
+                await self._session.send_text({"t": "set_quality", **updated})
+                self._emit(
+                    "log",
+                    f"自适应画质：{updated['scale']:.2f}× / 质量 {updated['quality']}（实测 {fps:.1f} fps）",
                 )
-                if (scale, quality) == (self._eff_scale, self._eff_quality):
-                    continue
-                self._eff_scale, self._eff_quality = scale, quality
-                await session.send_text({"t": "set_quality", **self._effective_payload()})
-                self._emit("auto_profile", {"fps": fps, "scale": scale, "quality": quality})
+                self._emit("auto_profile", {"fps": fps, "scale": updated["scale"],
+                                            "quality": updated["quality"]})
         except asyncio.CancelledError:
             pass
 
@@ -285,6 +244,8 @@ class ViewerWorker:
         self._pairer = BinaryPairer()
         self._incoming = {}
         self._connected_agent = agent_id
+        self._frames_window = 0
+        await session.send_text({"t": "set_quality", **self._video})
         self._emit("session_open", agent_id)
         asyncio.create_task(self._receive_loop(session))
 
@@ -343,6 +304,7 @@ class ViewerWorker:
             return
         kind = header.get("kind")
         if kind == "frame":
+            self._frames_window += 1
             self._emit("frame", {"header": header, "data": payload})
             return
         if kind != "file":
