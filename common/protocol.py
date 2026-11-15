@@ -34,6 +34,7 @@ KNOWN_TYPES = frozenset(
         "clip",
         "clip_ack",
         "file_offer",
+        "file_get",
         "file_accept",
         "file_reject",
         "file_done",

@@ -120,6 +120,14 @@ def test_quoted_path_is_accepted(tmp_path):
     assert reason == ""
 
 
+def test_file_get_survives_the_wire_protocol():
+    """file_get 必须在 KNOWN_TYPES 里，否则 decode 直接返 None，消息发出去就没了。"""
+    from common.protocol import decode, encode
+
+    message = {"t": "file_get", "path": r"C:\Users\admin\Desktop\报告.docx"}
+    assert decode(encode(message)) == message
+
+
 class _StubSession:
     def __init__(self) -> None:
         self.sent: list[dict] = []
