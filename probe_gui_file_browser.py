@@ -154,7 +154,7 @@ def main(remote_start: str, wait_seconds: float) -> None:
             names = [str(entry.get("name", "")) for entry in dlg.local.entries]
             if UPLOAD_NAME not in names:
                 print(f"RESULT failed 本机栏里没有 {UPLOAD_NAME}", flush=True)
-                win.root.after(300, win.root.quit)
+                end(1)
                 return
             index = names.index(UPLOAD_NAME)
             dlg.local.listbox.selection_clear(0, "end")
@@ -172,7 +172,7 @@ def main(remote_start: str, wait_seconds: float) -> None:
             names = [str(entry.get("name", "")) for entry in dlg.remote_pane.entries]
             if UPLOAD_NAME not in names:
                 print(f"RESULT failed 远端目录里没出现 {UPLOAD_NAME}", flush=True)
-                win.root.after(300, win.root.quit)
+                end(1)
                 return
             done["download_asked"] = True
             size = shoot(dlg.top, OUT_AFTER)
@@ -186,7 +186,7 @@ def main(remote_start: str, wait_seconds: float) -> None:
         if state["saved"]:
             print(f"saved {state['saved'][-1]}", flush=True)
             print("RESULT ok", flush=True)
-            win.root.after(600, win.root.quit)
+            end(0)
             return
 
         if elapsed > wait_seconds:
@@ -195,13 +195,27 @@ def main(remote_start: str, wait_seconds: float) -> None:
                 f"uploaded={state['uploaded']} saved={state['saved']}",
                 flush=True,
             )
-            win.root.after(300, win.root.quit)
+            end(1)
             return
 
         win.root.after(200, tick)
 
+    # 收尾：先让 worker 收摊（停掉自动重连），再退主循环，最后硬退进程。
+    # 之前只 quit 主循环，worker 的重连线程还在跑、一直去抢被控端会话，
+    # 下一轮测试就会撞 agent_busy。
+    def end(code: int) -> None:
+        state["exit_code"] = code
+        try:
+            win.commands.put(("shutdown", None))
+        except Exception:
+            pass
+        # 结果已经 flush 过了，这里直接硬退：走 root.quit 要等 worker 线程收摊，
+        # 实测会卡住不退，进程留着还一直抢被控端会话（下一轮就撞 agent_busy）。
+        win.root.after(300, lambda: os._exit(int(code)))
+
     win.root.after(300, tick)
     win.run()
+    os._exit(int(state.get("exit_code", 0)))
 
 
 if __name__ == "__main__":

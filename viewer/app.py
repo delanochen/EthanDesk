@@ -43,6 +43,11 @@ ADAPT_HIGH_FPS = 14.0
 VIEWER_RECONNECT_DELAY = 2.0
 VIEWER_RECONNECT_MAX_DELAY = 20.0
 
+# 被控端/中继还没把上一个会话收尾时会回 agent_busy。等它几秒通常就释放了，
+# 直接报错等于逼用户再点一次「连接」，所以这里自己重试几次。
+VIEWER_BUSY_RETRY_DELAY = 3.0
+VIEWER_BUSY_RETRIES = 3
+
 
 def next_video_profile(profile: dict, fps: float) -> dict | None:
     """AweSun-style auto quality: trade sharpness for frame rate on a slow link."""
@@ -266,7 +271,7 @@ class ViewerWorker:
         self._reconnect_code = code
         await self._teardown()
         self._emit("status", f"正在连接 {agent_id}…")
-        session = await self._client.open_session(agent_id, code)
+        session = await self._open_session(agent_id, code)
         self._session = session
         self._pairer = BinaryPairer()
         self._incoming = {}
@@ -275,6 +280,26 @@ class ViewerWorker:
         await session.send_text({"t": "set_quality", **self._video})
         self._emit("session_open", agent_id)
         asyncio.create_task(self._receive_loop(session))
+
+    async def _open_session(self, agent_id: str, code: str):
+        """开会话；撞上 agent_busy 时自动等被控端收尾再试。
+
+        只重试 agent_busy：口令错、被控端离线、对方拒绝协助之类要立刻让用户看到。
+        """
+        delay = VIEWER_BUSY_RETRY_DELAY
+        attempt = 0
+        while True:
+            try:
+                return await self._client.open_session(agent_id, code)
+            except DeskClientError as exc:
+                if getattr(exc, "code", "") != "agent_busy" or attempt >= VIEWER_BUSY_RETRIES:
+                    raise
+                attempt += 1
+                self._emit(
+                    "status",
+                    f"被控端还在结束上一个会话，{delay:.0f} 秒后重试（第 {attempt} 次）",
+                )
+                await asyncio.sleep(delay)
 
     async def _receive_loop(self, session: Session) -> None:
         try:

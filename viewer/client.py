@@ -12,7 +12,15 @@ from common.protocol import ProtocolError, decode, encode
 
 
 class DeskClientError(Exception):
-    """Raised for authentication or transport failures the GUI should surface."""
+    """Raised for authentication or transport failures the GUI should surface.
+
+    ``code`` 保留中继/被控端给的错误码（例如 ``agent_busy``），调用方据此决定是
+    立刻报错，还是等一会儿再试。
+    """
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def to_http_base(base_url: str) -> str:
@@ -148,7 +156,7 @@ class DeskClient:
                 return session
             code = payload.get("code", "unknown")
             await session.close()
-            raise DeskClientError(f"会话被拒绝：{code}")
+            raise DeskClientError(f"会话被拒绝：{code}", code=str(code))
         await session.close()
         raise DeskClientError("会话握手未完成")
 
