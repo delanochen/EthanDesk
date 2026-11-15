@@ -49,6 +49,29 @@ VIEWER_BUSY_RETRY_DELAY = 3.0
 VIEWER_BUSY_RETRIES = 3
 
 
+def human_bytes(size: int) -> str:
+    """人类可读的体积；文件传输状态栏用得到。"""
+    value = float(max(0, int(size)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if unit == "B":
+            if value < 1024:
+                return f"{int(value)} B"
+            continue
+        value /= 1024.0
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+    return f"{value:.1f} GB"
+
+
+def progress_text(direction: str, name: str, done: int, total: int) -> str:
+    """「上传 notes.txt 42%（430 KB / 1.0 MB）」——进度、体积、总量一眼看到。"""
+    total = max(0, int(total))
+    done = max(0, int(done))
+    percent = 100 if total == 0 else min(100, int(done * 100 / total))
+    verb = "下载" if direction == "down" else "上传"
+    return f"{verb} {name} {percent}%（{human_bytes(done)} / {human_bytes(total)}）"
+
+
 def next_video_profile(profile: dict, fps: float) -> dict | None:
     """AweSun-style auto quality: trade sharpness for frame rate on a slow link."""
     scale = float(profile.get("scale", 1.0))
@@ -418,6 +441,15 @@ class ViewerWorker:
             return
         try:
             incoming.feed(int(header.get("seq", 0)), payload)
+            self._emit(
+                "progress",
+                {
+                    "direction": "down",
+                    "name": incoming.name,
+                    "done": incoming.received,
+                    "total": incoming.expected_size,
+                },
+            )
             if incoming.received >= incoming.expected_size:
                 path = incoming.finish()
                 self._emit("file_saved", path)
@@ -459,10 +491,14 @@ class ViewerWorker:
             # 主控端选了远端目录：让被控端落到那个目录，而不是默认的 download_dir。
             offer["dir"] = target
         await session.send_text(offer)
+        name = os.path.basename(path)
+        sent = 0
         for header, chunk in outgoing.frames():
             await session.send_bin(header, chunk)
+            sent += len(chunk)
+            self._emit("progress", {"direction": "up", "name": name, "done": sent, "total": outgoing.size})
         where = f" → {target}" if target else ""
-        self._emit("log", f"已上传：{os.path.basename(path)}{where}")
+        self._emit("log", f"已上传：{name}{where}")
 
     async def _request_download(self, remote_path: str) -> None:
         """Ask the agent for a file; the agent answers with a direction="down" offer."""
@@ -1105,6 +1141,17 @@ class ViewerWindow:
                 if getattr(self, "remote_dialog", None) is not None:
                     self.remote_dialog.status_var.set(f"已保存到：{payload}")
                 self._messagebox.showinfo("文件已接收", f"已保存到：{payload}")
+            elif kind == "progress":
+                dialog = getattr(self, "remote_dialog", None)
+                if dialog is not None and isinstance(payload, dict):
+                    dialog.status_var.set(
+                        progress_text(
+                            str(payload.get("direction", "")),
+                            str(payload.get("name", "")),
+                            int(payload.get("done", 0) or 0),
+                            int(payload.get("total", 0) or 0),
+                        )
+                    )
             elif kind == "remote_list":
                 dialog = getattr(self, "remote_dialog", None)
                 if dialog is not None:

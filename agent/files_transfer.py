@@ -11,7 +11,7 @@ import hashlib
 import os
 from typing import Iterator
 
-from common.files import CHUNK_SIZE, FileTransferError, iter_chunks, safe_target_name
+from common.files import CHUNK_SIZE, FileTransferError, iter_chunks, safe_target_name, unique_path
 from common.protocol import make_bin_header
 
 
@@ -101,7 +101,8 @@ class IncomingFile:
                 raise FileTransferError("sha256 mismatch")
 
         os.makedirs(self.target_dir, exist_ok=True)
-        path = os.path.join(self.target_dir, self.name)
+        # 撞名不覆盖：对方机器上的同名文件可能是他正在用的东西。
+        path = unique_path(self.target_dir, self.name)
         with open(path, "wb") as handle:
             handle.write(payload)
         return path

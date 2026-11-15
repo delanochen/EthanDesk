@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ntpath
+import os
 import posixpath
 
 CHUNK_SIZE = 1024 * 1024
@@ -63,3 +64,20 @@ def safe_target_name(name: str) -> str:
     if not base:
         raise FileTransferError("empty file name")
     return base
+
+
+def unique_path(directory: str, name: str, limit: int = 999) -> str:
+    """A non-colliding path inside ``directory``: ``report.pdf`` → ``report (1).pdf``.
+
+    同名文件直接覆盖会把对方机器上的原文件弄丢，这是数据损失，不是风格问题；
+    所以撞名一律让位，序号加在后缀前面。
+    """
+    path = os.path.join(directory, name)
+    if not os.path.exists(path):
+        return path
+    stem, suffix = os.path.splitext(name)
+    for index in range(1, limit + 1):
+        candidate = os.path.join(directory, f"{stem} ({index}){suffix}")
+        if not os.path.exists(candidate):
+            return candidate
+    raise FileTransferError(f"target directory is crowded: {directory}")
