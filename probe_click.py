@@ -23,10 +23,13 @@ ATTEMPTS = 3
 
 async def attempt(x: float, y: float, button: str) -> bool:
     config = AgentConfig.load()
+    # 被控端可以不是本机：ETHANDESK_AGENT_ID / ETHANDESK_SESSION_CODE 覆盖配置里的默认设备。
+    agent_id = os.environ.get("ETHANDESK_AGENT_ID") or config.agent_id
+    code = os.environ.get("ETHANDESK_SESSION_CODE") or config.session_code
     client = DeskClient(DEFAULT_VIEWER_URL)
     try:
         await client.login(PASSWORD)
-        session = await client.open_session(config.agent_id, config.session_code)
+        session = await client.open_session(agent_id, code)
         await session.send_text({"t": "set_quality", "scale": 0.4, "quality": 45, "fps": 10})
         await asyncio.sleep(1.0)
         await session.send_text({"t": "input", "ev": "mouse_move", "x": x, "y": y})
