@@ -120,6 +120,31 @@ def test_quoted_path_is_accepted(tmp_path):
     assert reason == ""
 
 
+def test_refusal_is_reported_back_to_the_viewer(tmp_path):
+    """拒绝原因必须回给主控端，否则用户点了下载只会看到没反应。"""
+    worker = _worker()
+    worker._active_session = "sid-1"
+    ws = _FakeWs()
+
+    _serve(worker, ws, str(tmp_path))
+
+    notices = [item.get("text", "") for item in ws.texts if item.get("t") == "log"]
+    assert any("远端取文件被拒绝" in text and "目录" in text for text in notices)
+
+
+def test_success_is_reported_back_to_the_viewer(tmp_path):
+    source = tmp_path / "ok.txt"
+    source.write_bytes(b"ok" * 100)
+    worker = _worker()
+    worker._active_session = "sid-1"
+    ws = _FakeWs()
+
+    _serve(worker, ws, str(source))
+
+    notices = [item.get("text", "") for item in ws.texts if item.get("t") == "log"]
+    assert any("已发送文件 ok.txt" in text for text in notices)
+
+
 def test_get_offer_on_the_text_path_streams_the_file(tmp_path):
     """线上中继丢未知类型，所以请求走 file_offer/direction="get"，这条路径必须能用。"""
     source = tmp_path / "via-offer.txt"

@@ -584,7 +584,7 @@ class AgentWorker:
             await ws.send_str(encode(header))
             await ws.send_bytes(chunk)
         prefix = f"{reason}：" if reason else ""
-        self._emit("log", f"{prefix}已发送文件 {os.path.basename(path)}（{len(data)} bytes）")
+        await self._notify_viewer(ws, f"{prefix}已发送文件 {os.path.basename(path)}（{len(data)} bytes）")
 
     def resolve_pull_path(self, raw: str) -> tuple[str | None, str]:
         """Validate a viewer-supplied path for a remote pull.
@@ -615,15 +615,27 @@ class AgentWorker:
             )
         return text, ""
 
+    async def _notify_viewer(
+        self, ws: aiohttp.ClientWebSocketResponse, text: str
+    ) -> None:
+        """把取文件的结果回给主控端；本地日志只有被控端自己看得到。"""
+        self._emit("log", text)
+        if ws.closed:
+            return
+        try:
+            await ws.send_str(encode({"t": "log", "text": text}))
+        except (ConnectionResetError, RuntimeError):
+            pass
+
     async def _serve_get(
         self, ws: aiohttp.ClientWebSocketResponse, message: dict
     ) -> None:
         if not self._active_session:
-            self._emit("log", "没有活动会话，已拒绝远端取文件请求")
+            await self._notify_viewer(ws, "没有活动会话，已拒绝远端取文件请求")
             return
         path, reason = self.resolve_pull_path(str(message.get("path", "")))
         if path is None:
-            self._emit("log", f"远端取文件被拒绝：{reason}")
+            await self._notify_viewer(ws, f"远端取文件被拒绝：{reason}")
             return
         await self._push_file(ws, path, reason="远端取文件")
 
