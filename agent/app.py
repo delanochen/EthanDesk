@@ -345,10 +345,15 @@ class AgentWorker:
         if now - self._last_input_log < 1.0:
             return
         self._last_input_log = now
-        self._emit(
-            "log",
-            f"输入 {message.get('ev')} x={message.get('x')} y={message.get('y')} applied={applied}",
-        )
+        event = message.get("ev")
+        detail = f"x={message.get('x')} y={message.get('y')}"
+        if event == "text":
+            detail = f"text={str(message.get('text'))[:24]!r}"
+        elif event in ("key_down", "key_up"):
+            detail = f"keysym={message.get('keysym')}"
+        elif event in ("mouse_down", "mouse_up"):
+            detail = f"button={message.get('button')}"
+        self._emit("log", f"输入 {event} {detail} applied={applied}")
 
     async def _handle_binary(self, ws: aiohttp.ClientWebSocketResponse, data: bytes) -> None:
         try:

@@ -17,10 +17,13 @@ from common.keys import keysym_to_vk
 BOUNDS: dict[str, int] = {"left": 0, "top": 0, "width": 1920, "height": 1080}
 
 INPUT_EVENTS = frozenset(
-    {"mouse_move", "mouse_down", "mouse_up", "wheel", "key_down", "key_up"}
+    {"mouse_move", "mouse_down", "mouse_up", "wheel", "key_down", "key_up", "text"}
 )
 
 MAX_WHEEL_DELTA = 1200
+
+# 一次注入的文本上限。超出部分由远端的下一批补齐，避免一条消息卡住抓屏循环。
+MAX_TEXT_CHARS = 1024
 
 # Win32 constants
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -31,6 +34,8 @@ MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_WHEEL = 0x0800
 KEYEVENTF_KEYUP = 0x0002
+# 字符直接进 wScan，绕过键盘布局与输入法：中文、emoji 都能落进远端应用。
+KEYEVENTF_UNICODE = 0x0004
 
 _BUTTON_FLAGS = {
     "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -110,11 +115,11 @@ def _mouse_input(flags: int, data: int = 0) -> Any:
     return item
 
 
-def _key_input(vk: int, flags: int) -> Any:
+def _key_input(vk: int, flags: int, scan: int = 0) -> Any:
     INPUT, _, KEYBDINPUT = _structure_defs()
     item = INPUT()
     item.type = 1  # INPUT_KEYBOARD
-    item.ki = KEYBDINPUT(vk, 0, flags, 0, 0)
+    item.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
     return item
 
 
@@ -139,6 +144,35 @@ def key(vk: int, down: bool) -> None:
     _send([_key_input(int(vk), 0 if down else KEYEVENTF_KEYUP)])
 
 
+def type_text(text: str | None) -> None:
+    """Type ``text`` through Unicode injection, one UTF-16 unit at a time.
+
+    Tk cannot translate 中文/emoji keysyms into virtual keys, and driving an IME on the
+    agent side is both layout-dependent and slow. Unicode injection puts the character
+    itself into the event, so any application that accepts typed text gets it - which
+    is what AweSun does for non-ASCII input.
+    """
+    if not isinstance(text, str) or not text:
+        return
+    if sys.platform != "win32":
+        return
+
+    for char in text[:MAX_TEXT_CHARS]:
+        for unit in _utf16_units(char):
+            if not unit:
+                continue
+            _send([
+                _key_input(0, KEYEVENTF_UNICODE, unit),
+                _key_input(0, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, unit),
+            ])
+
+
+def _utf16_units(char: str) -> "list[int]":
+    """Split one character into the UTF-16 code units SendInput expects."""
+    raw = char.encode("utf-16-le")
+    return [int.from_bytes(raw[index:index + 2], "little") for index in range(0, len(raw), 2)]
+
+
 def apply_input(
     message: dict[str, Any],
     bounds: dict[str, int] | None = None,
@@ -147,6 +181,7 @@ def apply_input(
     button: Callable[[str, bool], None] = mouse_button,
     wheel: Callable[[int], None] = mouse_wheel,
     key: Callable[[int, bool], None] = key,
+    type_text: Callable[[str], None] = type_text,
 ) -> bool:
     """Replay one ``input`` message. Returns True when the event was dispatched."""
     event = message.get("ev")
@@ -186,6 +221,13 @@ def apply_input(
         if vk is None:
             return False
         key(vk, event == "key_down")
+        return True
+
+    if event == "text":
+        text = message.get("text")
+        if not isinstance(text, str) or not text:
+            return False
+        type_text(text[:MAX_TEXT_CHARS])
         return True
 
     return False

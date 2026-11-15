@@ -843,6 +843,12 @@ class ViewerWindow:
         keysym = getattr(event, "keysym", "")
         if not keysym:
             return "break"
+        # 非 ASCII 字符（中文/日文/emoji）没有可翻译的虚拟键，改走文本注入：
+        # 远端按字符本身落字，不依赖它那边的键盘布局或输入法。
+        char = getattr(event, "char", "") or ""
+        if down and len(char) == 1 and ord(char) > 0x7E:
+            self.commands.put(("input", {"t": "input", "ev": "text", "text": char}))
+            return "break"
         self.commands.put(
             ("input", {"t": "input", "ev": "key_down" if down else "key_up", "keysym": keysym})
         )

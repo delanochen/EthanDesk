@@ -67,3 +67,89 @@ def test_scroll_clamps_extreme_delta():
     calls = []
     apply_input({"t": "input", "ev": "wheel", "delta": 99999}, _bounds(), wheel=lambda d: calls.append(d))
     assert calls and abs(calls[0]) <= 1200
+
+
+def test_text_event_types_each_utf16_unit():
+    """中文/emoji 走 Unicode 注入：keysym 翻译不了，IME 也不一定在远端起效。"""
+    typed = []
+    apply_input(
+        {"t": "input", "ev": "text", "text": "中文"},
+        _bounds(),
+        type_text=lambda text: typed.append(text),
+    )
+    assert typed == ["中文"]
+
+
+def test_text_event_ignores_empty_and_non_string():
+    typed = []
+    for payload in ("", None, 123):
+        apply_input(
+            {"t": "input", "ev": "text", "text": payload},
+            _bounds(),
+            type_text=lambda text: typed.append(text),
+        )
+    assert typed == []
+
+
+def test_text_event_is_a_known_event():
+    assert unsupported_inputs({"t": "input", "ev": "text"}, _bounds()) is False
+
+
+def test_text_longer_than_the_cap_is_truncated():
+    typed = []
+    apply_input(
+        {"t": "input", "ev": "text", "text": "a" * 5000},
+        _bounds(),
+        type_text=lambda text: typed.append(text),
+    )
+    assert typed and len(typed[0]) <= 1024
+
+
+def test_type_text_sends_unicode_key_events(monkeypatch):
+    """真实注入路径：每个 UTF-16 单元一对 keydown/keyup，wScan 里放该单元。"""
+    import agent.inject as inject
+
+    sent = []
+    monkeypatch.setattr(inject, "_send", lambda inputs: sent.append(list(inputs)))
+
+    inject.type_text("A中")
+
+    assert len(sent) == 2
+    for batch in sent:
+        assert len(batch) == 2
+        down, up = batch
+        # wVk 必须是 0，靠 wScan 传字符；抬起那一条要带 UNICODE|KEYUP。
+        assert down.ki.wVk == 0
+        assert down.ki.dwFlags == inject.KEYEVENTF_UNICODE
+        assert up.ki.dwFlags == inject.KEYEVENTF_UNICODE | inject.KEYEVENTF_KEYUP
+    assert sent[0][0].ki.wScan == 0x41
+    assert sent[1][0].ki.wScan == 0x4E2D
+
+
+def test_type_text_handles_surrogate_pairs(monkeypatch):
+    """BMP 之外的字符要拆成两个 UTF-16 单元，否则 SendInput 会丢字。"""
+    import agent.inject as inject
+
+    batches = []
+    monkeypatch.setattr(inject, "_send", lambda inputs: batches.append(list(inputs)))
+
+    inject.type_text("\U0001F600")  # 😀
+
+    assert len(batches) == 2
+    units = [batch[0].ki.wScan for batch in batches]
+    assert units == [0xD83D, 0xDE00]
+
+
+def test_type_text_noop_for_empty_and_off_windows(monkeypatch):
+    import sys
+
+    import agent.inject as inject
+
+    calls = []
+    monkeypatch.setattr(inject, "_send", lambda inputs: calls.append(inputs))
+    inject.type_text("")
+    inject.type_text(None)
+    monkeypatch.setattr(sys, "platform", "linux")
+    inject.type_text("a")
+    assert calls == []
+
