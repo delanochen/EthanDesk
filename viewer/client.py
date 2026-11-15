@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 from urllib.parse import quote
-from urllib.parse import quote
 
 import aiohttp
 
@@ -135,8 +134,6 @@ class DeskClient:
         url = (
             f"{to_ws_base(self.base_url)}/ws/session?agent_id={agent_id}&token={self.token}"
         )
-        if code:
-            url += f"&code={quote(code)}"
         if code:
             url += f"&code={quote(code)}"
         try:

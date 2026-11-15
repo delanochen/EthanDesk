@@ -301,6 +301,8 @@ class AgentWorker:
                     self._note_input(message, applied)
                 except inject.InputInjectionError as exc:
                     self._emit("log", f"输入注入失败：{exc}")
+                except Exception as exc:  # 单条输入不能把整条远控会话带走
+                    self._emit("log", f"输入事件处理异常（{message.get('ev')}）：{exc}")
             elif self._debug_input:
                 self._emit(
                     "log",

@@ -63,7 +63,21 @@ def unsupported_inputs(message: dict[str, Any], bounds: dict[str, int] | None = 
     return message.get("ev") not in INPUT_EVENTS
 
 
+_STRUCTURES: tuple[Any, Any, Any] | None = None
+
+
 def _structure_defs() -> tuple[Any, Any, Any]:
+    """Build the SendInput structures once and reuse them.
+
+    ``SendInput`` takes an array of one INPUT type; building fresh ctypes classes on
+    every call makes the second event a different class, and the array constructor then
+    raises ``incompatible types, INPUT instance instead of INPUT instance``. On the
+    real machine that killed the whole remote session mid-typing.
+    """
+    global _STRUCTURES
+    if _STRUCTURES is not None:
+        return _STRUCTURES
+
     from ctypes import wintypes
 
     ulong_ptr = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
@@ -94,7 +108,8 @@ def _structure_defs() -> tuple[Any, Any, Any]:
         _anonymous_ = ("u",)
         _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
 
-    return INPUT, MOUSEINPUT, KEYBDINPUT
+    _STRUCTURES = (INPUT, MOUSEINPUT, KEYBDINPUT)
+    return _STRUCTURES
 
 
 def _send(inputs: list[Any]) -> None:

@@ -153,3 +153,45 @@ def test_type_text_noop_for_empty_and_off_windows(monkeypatch):
     inject.type_text("a")
     assert calls == []
 
+
+def test_key_input_instances_share_one_ctypes_class():
+    """批次里必须都是同一个 ctypes 结构类，否则组数组会 TypeError。
+
+    真机症状：中文注入时报 ``incompatible types, INPUT instance instead of INPUT
+    instance``，整个远控会话被踢断。
+    """
+    import agent.inject as inject
+
+    first = inject._key_input(0, inject.KEYEVENTF_UNICODE, 0x41)
+    second = inject._key_input(0, inject.KEYEVENTF_UNICODE, 0x4E2D)
+    mouse = inject._mouse_input(inject.MOUSEEVENTF_LEFTDOWN)
+
+    assert type(first) is type(second) is type(mouse)
+
+
+def test_send_batches_two_unicode_events(monkeypatch):
+    """一次 SendInput 送 down+up，就是真机崩过的那条路径。"""
+    import ctypes as real_ctypes
+
+    import agent.inject as inject
+
+    captured = {}
+
+    class FakeUser32:
+        def SendInput(self, count, array, size):
+            captured["count"] = count
+            captured["size"] = size
+            return count
+
+    fake_ctypes = type("FakeCtypes", (), {})()
+    fake_ctypes.sizeof = real_ctypes.sizeof
+    fake_ctypes.windll = type("W", (), {"user32": FakeUser32()})()
+    monkeypatch.setattr(inject, "ctypes", fake_ctypes)
+    monkeypatch.setattr(inject.sys, "platform", "win32")
+
+    inject.type_text("中")
+
+    assert captured["count"] == 2
+    assert captured["size"] > 0
+
+
