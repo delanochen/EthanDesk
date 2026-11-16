@@ -65,7 +65,22 @@ start-agent.bat              # 中继地址填 ws://127.0.0.1:8080/ws/agent，�
 start-viewer.bat             # 中继地址 http://127.0.0.1:8080，口令同上，登录后双击设备
 ```
 
-被控端会弹出"远程控制请求"，点"是"后主控端开始出画面。剪贴板同步勾选后双向生效；"上传文件…"把主控端文件推到被控端，被控端"向远控方发送文件…"反向推送，接收目录 `%USERPROFILE%\Downloads\deskrelay`。
+被控端会弹出"远程控制请求"，点"是"后主控端开始出画面。剪贴板同步勾选后双向生效；"上传文件…"把主控端文件推到被控端，被控端"向远控方发送文件…"反向推送，接收目录 `%USERPROFILE%\Downloads\deskrelay`。同名文件不覆盖，落盘时自动变成 `notes (1).txt`。
+
+## 免安装 exe、托盘与版本检查
+
+```powershell
+# 打包：产物在 dist\ 下，拷到别的 Windows 机器直接双击，不需要 Python 或安装程序
+.\packaging\build_windows.ps1              # 两个都打
+.\packaging\build_windows.ps1 -Target viewer
+```
+
+- `dist\EthanDesk.exe` —— 主控端（约 20 MB，单文件）。
+- `dist\DeskAgent.exe` —— 被控端（同一套代码的另一入口）。
+- 关窗口只是收进系统托盘（右下角图标），托盘菜单「打开 EthanDesk / 退出」；托盘后端不可用时会退化成普通窗口并在侧栏写明原因。
+- 每次登录中继后自动查一次新版本，命中就提示并可一键打开下载页；侧栏常驻「版本 vX.Y.Z」与「检查更新」按钮。
+- 版本号只有两处：`common/version.py` 的 `APP_VERSION`（代码里用的）与仓库根 `VERSION`（客户端读的"线上最新版"）。发版时两处一起改，推上去即生效。
+
 
 ## 部署到 Debian（192.168.7.202）
 

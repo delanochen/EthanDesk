@@ -12,6 +12,11 @@ venv/
 *.log
 deskrelay.env
 
+# packaging output（PyInstaller 产物，20MB 级二进制不进仓库）
+dist/
+build/
+*.spec
+
 # local editor
 .vscode/
 .idea/
