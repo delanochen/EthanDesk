@@ -244,3 +244,83 @@ def test_close_hides_to_tray_instead_of_stopping_the_service():
             window.root.destroy()
         except tk.TclError:
             pass
+
+def test_explain_session_error_speaks_plain_chinese():
+    from desk.client import explain_session_error
+
+    assert explain_session_error("中继错误：session_denied") == "对方拒绝了本次远程协助请求"
+    assert "不在线" in explain_session_error("中继错误：agent_offline")
+    assert explain_session_error("文件接收失败：x") == "文件接收失败：x"
+
+
+def test_self_target_detection_ignores_spaces():
+    from desk.client import is_self_target
+
+    assert is_self_target("146 896 644", "146896644")
+    assert is_self_target("146896644", "146 896 644")
+    assert not is_self_target("448098688", "146896644")
+    assert not is_self_target("", "146896644")
+
+
+class _RecordingBox:
+    def __init__(self) -> None:
+        self.warnings = []
+        self.infos = []
+
+    def showwarning(self, title, message):
+        self.warnings.append((title, message))
+
+    def showinfo(self, title, message):
+        self.infos.append((title, message))
+
+    def askyesno(self, *_args, **_kwargs):
+        return False
+
+
+def test_connecting_to_this_machine_is_refused_up_front():
+    """自己不能远程自己：识别码填成本机就该当场拦住，别去中继上绕一圈。"""
+    import tkinter as tk
+
+    import pytest
+
+    from desk.client import DeskWindow
+
+    try:
+        window = DeskWindow(start_threads=False)
+    except tk.TclError as exc:
+        pytest.skip(f"no display: {exc}")
+    box = _RecordingBox()
+    window._messagebox = box
+    try:
+        own = window.agent_config.agent_id
+        window.peer_var.set(" ".join([own[:3], own[3:6], own[6:]]))
+        window._connect_peer()
+        assert box.warnings, "连自己应该弹窗"
+        assert window.viewer_commands.empty(), "不该真的发起连接"
+        assert "本机" in window.remote_notice.get()
+    finally:
+        window.root.destroy()
+
+
+def test_session_denied_shows_a_dialog_not_only_a_corner_status():
+    """会话被拒要弹窗 + 页面提示，不能只写状态栏。"""
+    import tkinter as tk
+
+    import pytest
+
+    from desk.client import DeskWindow
+
+    try:
+        window = DeskWindow(start_threads=False)
+    except tk.TclError as exc:
+        pytest.skip(f"no display: {exc}")
+    box = _RecordingBox()
+    window._messagebox = box
+    try:
+        window.viewer_events.put(("error", "中继错误：session_denied"))
+        window._drain()
+        assert box.warnings and "拒绝" in box.warnings[0][1]
+        assert "拒绝" in window.remote_notice.get()
+        assert window.pages["远程协助"].winfo_exists()
+    finally:
+        window.root.destroy()

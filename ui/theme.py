@@ -68,6 +68,8 @@ def apply_theme(root):
     style.configure("Ident.TLabel", background=PALETTE["bg"], foreground=PALETTE["text"], font=("Consolas", 26, "bold"))
     style.configure("Code.TLabel", background=PALETTE["bg"], foreground=PALETTE["accent_hover"],
                     font=("Consolas", 22, "bold"))
+    style.configure("Warn.TLabel", background=PALETTE["bg"], foreground=PALETTE["danger"],
+                    font=(FONT, 10, "bold"))
 
     style.configure("TButton", background=PALETTE["panel"], foreground=PALETTE["text"],
                     borderwidth=0, focusthickness=0, padding=(12, 7))

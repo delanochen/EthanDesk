@@ -40,6 +40,37 @@ def connect_label(connected: bool) -> str:
     return "断开" if connected else "连接"
 
 
+#: 中继的错误码 → 给人看的一句话。会话类的错误要弹窗，不能只在状态栏角落里留一行。
+SESSION_ERROR_HINTS = {
+    "session_denied": "对方拒绝了本次远程协助请求",
+    "agent_offline": "对方设备不在线，请确认它已登录并且允许协助",
+    "agent_busy": "对方正在被其他人协助，请稍后再试",
+    "agent_gone": "对方设备已离线，请稍后再连",
+    "session_timeout": "对方长时间没有响应，请重试",
+}
+
+
+def explain_session_error(text: str) -> str:
+    """把 ``中继错误：session_denied`` 翻成人话；认不出就原样返回。"""
+    raw = str(text)
+    for code, hint in SESSION_ERROR_HINTS.items():
+        if code in raw:
+            return hint
+    return raw
+
+
+def normalise_ident(value: str) -> str:
+    """识别码里的空格、横线都不算数，比较前先剥掉。"""
+    return "".join(ch for ch in str(value) if ch.isdigit())
+
+
+def is_self_target(target: str, own_id: str) -> bool:
+    """自己连自己：无论识别码写成 ``146 896 644`` 还是 ``146896644`` 都算。"""
+    target_id = normalise_ident(target)
+    own = normalise_ident(own_id)
+    return bool(target_id) and target_id == own
+
+
 class DeskWindow:
     def __init__(self, start_threads: bool = True, enable_tray: bool | None = None) -> None:
         import tkinter as tk
@@ -124,6 +155,7 @@ class DeskWindow:
         self.metric_var = tk.StringVar(value="")
         self.login_info = tk.StringVar(value="未登录")
         self.version_note = tk.StringVar(value=f"v{app_version()}")
+        self.remote_notice = tk.StringVar(value="")
 
         self._build_layout()
         # 测试或自动化里不该往通知区域塞图标：默认只有在真正启动线程时才挂托盘
@@ -352,6 +384,9 @@ class DeskWindow:
                         variable=self.file_mode_var).pack(side="left")
         ttk.Radiobutton(mode, text="远程文件（暂不支持）", value="file",
                         variable=self.file_mode_var, state="disabled").pack(side="left", padx=18)
+
+        # 会话被拒/设备离线这类结果要写在页面上，不能只往状态栏角落里塞一行字
+        ttk.Label(page, textvariable=self.remote_notice, style="Warn.TLabel").pack(anchor="w", pady=(8, 0))
 
         ttk.Separator(page).pack(fill="x", pady=(20, 12))
         bar = ttk.Frame(page)
@@ -753,6 +788,15 @@ class DeskWindow:
         if not agent_id:
             self._messagebox.showinfo("未选择设备", "请输入伙伴识别码，或先在设备列表里选一台")
             return
+        if is_self_target(agent_id, self.agent_config.agent_id):
+            self.remote_notice.set("这就是本机，不能自己协助自己")
+            self._messagebox.showwarning(
+                "不能协助本机",
+                f"识别码 {agent_id} 就是这台机器。\n\n"
+                "想从别的设备连过来：在伙伴设备上输入本机识别码和验证码，\n"
+                "并把这里「允许他人协助本机」打开。")
+            return
+        self.remote_notice.set("")
         self.viewer_commands.put(("login", {"url": self.viewer_url_var.get().strip(),
                                            "password": self.password_var.get()}))
         self.viewer_commands.put(("connect", {"agent_id": agent_id, "code": self.peer_code_var.get().strip()}))
@@ -764,6 +808,13 @@ class DeskWindow:
         if not selection:
             self._messagebox.showinfo("未选择设备", "请先在在线设备列表里选一台")
             return
+        if is_self_target(selection[0], self.agent_config.agent_id):
+            self.remote_notice.set("这就是本机，不能自己协助自己")
+            self._messagebox.showwarning(
+                "不能协助本机",
+                f"识别码 {selection[0]} 就是这台机器，请选择另一台设备。")
+            return
+        self.remote_notice.set("")
         self.viewer_commands.put(("login", {"url": self.viewer_url_var.get().strip(),
                                            "password": self.password_var.get()}))
         self.viewer_commands.put(("connect", {"agent_id": selection[0],
@@ -1064,13 +1115,25 @@ class DeskWindow:
                 self.version_note.set(f"v{app_version()} · 已是最新")
                 self._append_log("检查更新：已是最新版本")
             elif kind == "error":
-                self.status_var.set(f"错误：{payload}")
-                self._append_log(f"错误：{payload}")
+                self._raise_session_error(payload)
             elif kind == "log":
                 self.status_var.set(str(payload))
             elif kind == "file_saved":
                 self._append_log(f"文件已保存：{payload}")
         self.root.after(60, self._drain)
+
+    def _raise_session_error(self, payload) -> None:
+        """会话类错误（被拒/离线/占用）要弹窗 + 页面上红字，不能只在状态栏角落留一行。"""
+        text = str(payload)
+        self.status_var.set(f"错误：{text}")
+        self._append_log(f"错误：{text}")
+        hint = explain_session_error(text)
+        if hint == text:
+            return
+        self.remote_notice.set(hint)
+        self.connected = False
+        self._show_page("远程协助")
+        self._messagebox.showwarning("远程协助", hint)
 
     def _render_agents(self, agents: list) -> None:
         existing = set(self.tree.get_children())
