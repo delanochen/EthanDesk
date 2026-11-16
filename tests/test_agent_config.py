@@ -58,3 +58,10 @@ def test_serve_on_start_defaults_to_true_and_round_trips(tmp_path):
     path = tmp_path / "agent.json"
     AgentConfig(serve_on_start=False).save(str(path))
     assert AgentConfig.load(str(path)).serve_on_start is False
+
+
+def test_reported_version_follows_the_build():
+    """设备列表里的版本要跟 exe 一致，不能写死成旧版本号。"""
+    from common.version import APP_VERSION
+
+    assert AgentConfig().info()["version"] == APP_VERSION

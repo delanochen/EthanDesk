@@ -11,6 +11,8 @@ from viewer.app import (
     ADAPT_MAX_QUALITY,
     ADAPT_MIN_QUALITY,
     ADAPT_MIN_SCALE,
+    START_QUALITY,
+    START_SCALE,
     ViewerWorker,
     next_video_profile,
 )
@@ -103,6 +105,82 @@ def test_worker_flips_auto_even_without_session():
     worker = _worker()
     asyncio.run(worker._dispatch(("auto_quality", True)))
     assert worker._auto_quality is True
+
+
+def test_first_frame_starts_low_so_a_slow_link_sees_something_quickly():
+    """首帧必须是低档：满档第一帧接近 200 KB，跨洋链路上等于又黑屏一次。"""
+    worker = _worker()
+    worker._auto_quality = True
+    worker._target = {"quality": 70, "scale": 1.0, "fps": 15}
+    start = worker._start_profile()
+    assert start["scale"] == START_SCALE
+    assert start["quality"] == START_QUALITY
+    assert start["fps"] == 15
+
+
+def test_start_profile_never_exceeds_what_the_user_asked_for():
+    worker = _worker()
+    worker._auto_quality = True
+    worker._target = {"quality": 40, "scale": 0.3, "fps": 10}
+    start = worker._start_profile()
+    assert start["scale"] == 0.3
+    assert start["quality"] == 40
+    assert start["fps"] == 10
+
+
+def test_start_profile_is_the_user_profile_when_auto_is_off():
+    worker = _worker()
+    worker._auto_quality = False
+    worker._target = {"quality": 80, "scale": 1.0, "fps": 20}
+    assert worker._start_profile() == {"quality": 80, "scale": 1.0, "fps": 20}
+
+
+def test_handshake_target_does_not_raise_the_low_first_frame():
+    """握手报的是目标档，生效档要停在低档上，否则首帧优化白做。"""
+    worker = _worker()
+    worker._auto_quality = True
+    worker._video = worker._start_profile()
+    stub = _StubSession()
+    worker._session = stub
+    asyncio.run(worker._dispatch(("target", {"quality": 95, "scale": 1.0, "fps": 15})))
+    assert _quality_messages(stub)[-1]["scale"] == START_SCALE
+    assert worker._target["quality"] == 95
+
+
+def test_climb_stops_at_the_user_target():
+    """升档不能越过用户选的档位，否则自适应等于偷偷把画质顶到 85。"""
+    profile = {"quality": 30, "scale": 0.5, "fps": 15}
+    target = {"quality": 70, "scale": 1.0, "fps": 15}
+    for _ in range(40):
+        updated = next_video_profile(profile, fps=20.0, target=target)
+        if updated is None:
+            break
+        profile = updated
+    assert profile["scale"] == 1.0
+    assert profile["quality"] == 70
+    assert next_video_profile(profile, fps=20.0, target=target) is None
+
+
+def test_climb_respects_a_lower_target():
+    profile = {"quality": 40, "scale": 0.5, "fps": 15}
+    target = {"quality": 45, "scale": 0.7, "fps": 15}
+    updated = next_video_profile(profile, fps=20.0, target=target)
+    assert updated is not None
+    assert updated["scale"] == 0.6
+    assert updated["quality"] == 45
+    assert next_video_profile({"quality": 45, "scale": 0.7, "fps": 15}, fps=20.0, target=target) is None
+
+
+def test_enabling_auto_quality_falls_back_to_the_low_start_profile():
+    worker = _worker()
+    worker._auto_quality = False
+    worker._target = {"quality": 70, "scale": 1.0, "fps": 15}
+    worker._video = {"quality": 70, "scale": 1.0, "fps": 15}
+    stub = _StubSession()
+    worker._session = stub
+    asyncio.run(worker._dispatch(("auto_quality", True)))
+    assert worker._video["scale"] == START_SCALE
+    assert _quality_messages(stub)[-1]["scale"] == START_SCALE
 
 
 def test_delivered_frames_are_counted_for_the_adapt_window():

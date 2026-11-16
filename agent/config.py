@@ -16,6 +16,7 @@ from common.session_code import (
     generate_code,
     normalise,
 )
+from common.version import app_version
 
 APP_DIR_NAME = "deskrelay"
 CONFIG_NAME = "agent.json"
@@ -62,7 +63,8 @@ class AgentConfig:
             "name": self.name,
             "host": socket.gethostname(),
             "os": "Windows",
-            "version": "1.0.1",
+            # 上报给中继的版本必须和 exe 里的一致，否则设备列表显示的版本永远停在旧值。
+            "version": app_version(),
         }
 
     def rotate_session_code(self, now: float | None = None) -> str:

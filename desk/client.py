@@ -927,7 +927,20 @@ class DeskWindow:
             self._append_log(f"保存配置失败：{exc}")
 
     def _send_settings(self) -> None:
+        """用户点「应用」：手动档位立即生效，并关掉自适应（手动优先）。"""
         self.viewer_commands.put(("settings", {
+            "quality": int(self.quality_var.get()),
+            "scale": float(self.scale_var.get()),
+            "fps": int(self.fps_var.get()),
+        }))
+
+    def _send_target(self) -> None:
+        """握手时把用户选的档位报给主控端。
+
+        注意发的是 ``target`` 而不是 ``settings``：后者是「手动改档、立即生效」，
+        会把主控端已经降下来的首帧低档顶回满档，慢链路上等于又黑屏一次。
+        """
+        self.viewer_commands.put(("target", {
             "quality": int(self.quality_var.get()),
             "scale": float(self.scale_var.get()),
             "fps": int(self.fps_var.get()),
@@ -1092,7 +1105,7 @@ class DeskWindow:
                 self._render_frame(payload)
             elif kind == "meta":
                 self.status_var.set(f"已连接 · {payload.get('width')}×{payload.get('height')}")
-                self._send_settings()
+                self._send_target()
                 if self.auto_var.get():
                     self.viewer_commands.put(("auto_quality", True))
             elif kind == "auto_profile":

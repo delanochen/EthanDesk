@@ -40,7 +40,15 @@ ADAPT_MIN_SCALE = 0.5
 ADAPT_MIN_QUALITY = 35
 ADAPT_MAX_QUALITY = 85
 ADAPT_LOW_FPS = 3.0
-ADAPT_HIGH_FPS = 14.0
+# 升档阈值取目标帧率的八成（15 fps 目标 ≈ 12），原来卡在 14 fps 时，档位一到
+# 0.7× 帧率就落在 13~14 之间，既不算慢也不算快，自适应会永远停在半清晰档上。
+ADAPT_HIGH_FPS = 12.0
+
+# 首帧档位：连上先用这一档把画面拍出来，再按实测帧率往上爬到用户的档位。
+# 慢链路上 1.0×/q70 的第一帧接近 200 KB，光搬这一帧就要几秒，用户看到的是
+# 「连上了但没画面」；0.5×/q60 大约只有它的四分之一。
+START_SCALE = 0.5
+START_QUALITY = 60
 
 # 主控端断线重连：会话不是用户主动断开时，隔一小会儿自动重连，失败则退避加倍。
 # 被控端重启只要几秒，所以首次间隔取小值；退避上限防止长时间空转。
@@ -76,8 +84,12 @@ def progress_text(direction: str, name: str, done: int, total: int) -> str:
     return f"{verb} {name} {percent}%（{human_bytes(done)} / {human_bytes(total)}）"
 
 
-def next_video_profile(profile: dict, fps: float) -> dict | None:
-    """AweSun-style auto quality: trade sharpness for frame rate on a slow link."""
+def next_video_profile(profile: dict, fps: float, target: dict | None = None) -> dict | None:
+    """AweSun-style auto quality: trade sharpness for frame rate on a slow link.
+
+    ``target`` is the ceiling the climb must stop at — the profile the user actually asked
+    for. Without it the climb only stops at the global caps.
+    """
     scale = float(profile.get("scale", 1.0))
     quality = int(profile.get("quality", 70))
     if fps < ADAPT_LOW_FPS and scale > ADAPT_MIN_SCALE:
@@ -86,11 +98,15 @@ def next_video_profile(profile: dict, fps: float) -> dict | None:
             "scale": max(ADAPT_MIN_SCALE, round(scale - 0.15, 3)),
             "quality": max(ADAPT_MIN_QUALITY, quality - 8),
         }
-    if fps > ADAPT_HIGH_FPS and scale < 1.0:
+    ceiling_scale = min(1.0, float((target or {}).get("scale", 1.0)))
+    ceiling_quality = min(ADAPT_MAX_QUALITY, int((target or {}).get("quality", ADAPT_MAX_QUALITY)))
+    if fps > ADAPT_HIGH_FPS and (scale < ceiling_scale or quality < ceiling_quality):
+        # 缩放先到顶，清晰度接着往上爬：scale 卡在 1.0 不是终点，用户要的 q 还没到。
         return {
             **profile,
-            "scale": min(1.0, round(scale + 0.1, 3)),
-            "quality": min(ADAPT_MAX_QUALITY, quality + 5),
+            "scale": min(ceiling_scale, round(scale + 0.1, 3)),
+            "quality": min(ceiling_quality, quality + 5),
+            "fps": float((target or {}).get("fps", profile.get("fps", 15))),
         }
     return None
 
@@ -111,10 +127,11 @@ class ViewerWorker:
         self._connected_agent = ""
         self._last_remote_path = ""
         self.download_dir = DEFAULT_DOWNLOAD_DIR
-        # Picture profile in force. It starts at the neutral profile the agent defaults to
-        # and is lowered window by window while auto quality is on.
-        self._video: dict[str, float] = {"quality": 70, "scale": 1.0, "fps": 15}
+        # 用户实际要的档位（滑块那一套）。自适应关掉时它就是生效档；开着时只是爬坡的终点。
+        self._target: dict[str, float] = {"quality": 70, "scale": 1.0, "fps": 15}
         self._auto_quality = bool(ViewerConfig.load().auto_quality)
+        # 生效档位。自适应开着时从 START_* 起步，再按实测帧率往 _target 爬。
+        self._video: dict[str, float] = self._start_profile()
         self._frames_window = 0
         # Reconnect bookkeeping: remember the last session we opened, and whether the
         # close was the user's own doing (断开) or a fault the viewer should heal itself.
@@ -187,8 +204,18 @@ class ViewerWorker:
                 self._emit("auto_quality", self._auto_quality)
                 if self._session is not None:
                     await self._session.send_text({"t": "set_quality", **self._video})
+            elif action == "target":
+                # 握手用：客户端只是告诉主控端「我要的档位是什么」，生效档仍停在首帧低档上。
+                self._remember_target(payload)
+                if self._session is not None:
+                    await self._session.send_text({"t": "set_quality", **self._video})
             elif action == "auto_quality":
                 self._auto_quality = bool(payload)
+                if self._auto_quality:
+                    # 打开自适应就从低档重新起步，别让已经拉满的档位把慢链路堵住。
+                    self._video = self._start_profile()
+                elif self._session is not None:
+                    self._video = dict(self._target)
                 if self._session is not None:
                     await self._session.send_text({"t": "set_quality", **self._video})
                 self._emit("auto_quality", self._auto_quality)
@@ -214,14 +241,35 @@ class ViewerWorker:
             self._emit("error", f"内部错误：{exc!r}")
 
     # ------------------------------------------------------------- picture profile
-    def _remember_settings(self, payload) -> None:
+    def _start_profile(self) -> dict:
+        """连上时先下发的档位。
+
+        自适应开着就先用低档把首帧拍出来（慢链路上这决定了「秒出画面」还是「黑屏几秒」），
+        自适应关着则是用户自己选的档位，不再替他做主。
+        """
+        if not self._auto_quality:
+            return dict(self._target)
+        return {
+            "quality": min(int(self._target["quality"]), START_QUALITY),
+            "scale": min(float(self._target["scale"]), START_SCALE),
+            "fps": int(self._target["fps"]),
+        }
+
+    def _remember_target(self, payload) -> None:
+        """只记目标档，不动当前生效档——握手时用它，避免把已经降下来的首帧又顶回满档。"""
         if not isinstance(payload, dict):
             return
         for key in ("quality", "scale", "fps"):
             if key in payload:
-                self._video[key] = payload[key]
+                self._target[key] = payload[key]
+
+    def _remember_settings(self, payload) -> None:
+        if not isinstance(payload, dict):
+            return
+        self._remember_target(payload)
         # A manual choice wins: stop the auto-quality loop from overriding it.
         self._auto_quality = False
+        self._video = dict(self._target)
 
     async def _adapt_loop(self) -> None:
         """Watch the delivered frame rate and shrink the picture when the link is slow."""
@@ -233,7 +281,7 @@ class ViewerWorker:
                     continue
                 fps = self._frames_window / ADAPT_WINDOW
                 self._frames_window = 0
-                updated = next_video_profile(self._video, fps)
+                updated = next_video_profile(self._video, fps, self._target)
                 if updated is None:
                     continue
                 self._video = updated
@@ -304,6 +352,8 @@ class ViewerWorker:
         self._incoming = {}
         self._connected_agent = agent_id
         self._frames_window = 0
+        # 先用首帧低档把画面拍出来，后面的升档交给自适应循环。
+        self._video = self._start_profile()
         await session.send_text({"t": "set_quality", **self._video})
         self._emit("session_open", agent_id)
         asyncio.create_task(self._receive_loop(session))

@@ -9,6 +9,7 @@ keyboard events, so it is safe to run on a machine someone is using.
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import sys
 import tempfile
@@ -16,7 +17,7 @@ import tempfile
 from aiohttp import web
 
 from agent.app import AgentWorker
-from agent.config import AgentConfig
+from agent.config import AgentConfig, config_dir
 from relay.app import create_app
 from relay.config import RelayConfig
 from viewer.client import DeskClient
@@ -47,6 +48,12 @@ async def _consent_loop(
 
 async def _run() -> int:
     with tempfile.TemporaryDirectory() as tmp:
+        # 被控端每次会话结束都会把配置写回默认目录；这里是假设备，
+        # 配置绝不能落到真机上，否则会覆盖用户真实的中继地址和验证码。
+        os.environ["APPDATA"] = tmp
+        if not config_dir().startswith(tmp):
+            raise RuntimeError(f"agent config dir escaped the temp dir: {config_dir()}")
+
         config = RelayConfig(
             viewer_password="live-password",
             agent_key="live-agent-key-0123456789",
