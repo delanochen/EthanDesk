@@ -13,6 +13,7 @@ import os
 import queue
 import threading
 import time
+import webbrowser
 from typing import Any
 
 from agent.files_transfer import FileTransferError, IncomingFile, OutgoingFile
@@ -20,8 +21,11 @@ from common.coords import canvas_to_frame_norm, letterbox_fit
 from common.keys import text_for_key
 from common.protocol import BinaryPairer, encode, make_bin_header
 from common.defaults import DEFAULT_VIEWER_URL
+from common.update import check_update
+from common.version import APP_NAME, app_version
 from viewer.client import DeskClient, DeskClientError, Session
 from viewer.config import ViewerConfig
+from viewer.tray import TrayController, TrayUnavailable
 
 COMMAND_POLL = 0.01
 AGENT_REFRESH = 5.0
@@ -574,9 +578,14 @@ class ViewerWindow:
         self.last_local_dir = ""
 
         self.root = tk.Tk()
-        self.root.title("远程桌面 · 主控端")
+        self.root.title(f"{APP_NAME} 主控端 · v{app_version()}")
         self.root.geometry("1180x760")
         self.root.minsize(900, 600)
+        # 托盘：关窗口只是收起，真要退出走托盘菜单或正在退出标记
+        self.tray: TrayController | None = None
+        self._quitting = False
+        self._tray_hinted = False
+        self._update_checked = False
 
         self.settings = ViewerConfig.load()
         self.url_var = tk.StringVar(value=self.settings.relay_url)
@@ -593,8 +602,67 @@ class ViewerWindow:
         self.login_info = tk.StringVar(value="")
 
         self._build_layout()
+        self._setup_tray()
         self.root.after(30, self._drain_events)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------------------------------------------------------------- tray / update
+    def _setup_tray(self) -> None:
+        """右下角托盘图标；没有托盘后端就退化成普通窗口，并说明原因。"""
+        try:
+            tray = TrayController(
+                APP_NAME,
+                on_show=lambda: self.root.after(0, self._restore_window),
+                on_quit=lambda: self.root.after(0, self._quit_from_tray),
+                tooltip=f"{APP_NAME} v{app_version()}",
+            )
+            tray.start()
+        except TrayUnavailable as exc:
+            self.update_var.set(f"版本 v{app_version()} · 托盘不可用：{exc}")
+            return
+        except Exception as exc:  # 托盘后端偶尔在无桌面会话里直接抛
+            self.update_var.set(f"版本 v{app_version()} · 托盘不可用：{exc!r}")
+            return
+        self.tray = tray
+
+    def _restore_window(self) -> None:
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except self._tk.TclError:
+            pass
+
+    def _quit_from_tray(self) -> None:
+        self._quitting = True
+        self._on_close()
+
+    def _start_update_check(self, force: bool = False) -> None:
+        if self._update_checked and not force:
+            return
+        self._update_checked = True
+        self.update_var.set(f"版本 v{app_version()} · 正在检查更新…")
+        current = app_version()
+
+        def work() -> None:
+            info = check_update(current)
+            # 结果一律回 Tk 线程再动界面
+            self.events.put(("update", info) if info else ("update_none", None))
+
+        threading.Thread(target=work, name="ethandesk-update", daemon=True).start()
+
+    def _show_update(self, info: dict) -> None:
+        version = str(info.get("version", ""))
+        current = str(info.get("current", app_version()))
+        self.update_var.set(f"发现新版本 v{version}（当前 v{current}）")
+        self.status_var.set(f"有新版本：v{version}")
+        if self.tray is not None:
+            self.tray.notify(f"发现新版本 v{version}，点托盘图标可查看", APP_NAME)
+        if self._messagebox.askyesno(
+            "发现新版本",
+            f"EthanDesk 有新版本 v{version}（当前 v{current}）。\n\n是否打开下载页？",
+        ):
+            webbrowser.open(str(info.get("url", "")))
 
     # ---------------------------------------------------------------- layout
     def _build_layout(self) -> None:
@@ -627,6 +695,11 @@ class ViewerWindow:
         foot.pack(side="bottom", fill="x", padx=18, pady=16)
         ttk.Label(foot, textvariable=self.status_var, style="SidebarMuted.TLabel",
                   wraplength=150, justify="left").pack(anchor="w")
+        self.update_var = tk.StringVar(value=f"版本 v{app_version()}")
+        ttk.Label(foot, textvariable=self.update_var, style="SidebarMuted.TLabel",
+                  wraplength=150, justify="left").pack(anchor="w", pady=(6, 0))
+        ttk.Button(foot, text="检查更新", command=lambda: self._start_update_check(force=True)).pack(
+            anchor="w", pady=(6, 0))
 
         main = ttk.Frame(shell)
         main.pack(side="left", fill="both", expand=True)
@@ -1167,8 +1240,14 @@ class ViewerWindow:
                 self.status_var.set("会话已结束")
                 self.frame_image = None
                 self.canvas.delete("frame")
+            elif kind == "update":
+                if isinstance(payload, dict):
+                    self._show_update(payload)
+            elif kind == "update_none":
+                self.update_var.set(f"版本 v{app_version()} · 已是最新")
             elif kind == "logged_in":
                 self.login_info.set(f"已登录：{payload}")
+                self._start_update_check()
             elif kind == "error":
                 self.status_var.set(f"错误：{payload}")
                 self._messagebox.showerror("操作失败", str(payload))
@@ -1214,7 +1293,20 @@ class ViewerWindow:
             )
 
     def _on_close(self) -> None:
+        # 有托盘时关窗口只是收起，和向日葵一致：图标还在，双击就回来
+        if self.tray is not None and not getattr(self, "_quitting", False):
+            try:
+                self.root.withdraw()
+            except self._tk.TclError:
+                pass
+            if not getattr(self, "_tray_hinted", False):
+                self._tray_hinted = True
+                self.tray.notify("EthanDesk 还在后台运行，双击托盘图标可以恢复窗口", APP_NAME)
+            return
         self.commands.put(("shutdown", None))
+        if self.tray is not None:
+            self.tray.stop()
+            self.tray = None
         self.root.destroy()
 
     def run(self) -> None:
