@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import queue
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -71,8 +72,14 @@ def is_self_target(target: str, own_id: str) -> bool:
     return bool(target_id) and target_id == own
 
 
+def hide_on_start(start_minimized: bool, has_tray: bool) -> bool:
+    """开机自启只在有托盘时才藏起来——没托盘还藏，人就没法把它叫回来。"""
+    return bool(start_minimized and has_tray)
+
+
 class DeskWindow:
-    def __init__(self, start_threads: bool = True, enable_tray: bool | None = None) -> None:
+    def __init__(self, start_threads: bool = True, enable_tray: bool | None = None,
+                 start_minimized: bool = False) -> None:
         import tkinter as tk
         from tkinter import messagebox, ttk
 
@@ -164,6 +171,10 @@ class DeskWindow:
             self._setup_tray()
         self.root.after(60, self._drain)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if hide_on_start(start_minimized, self.tray is not None):
+            # 没有托盘就没法“最小化到托盘”，那种情况保留窗口，别把人挡在门外
+            self.root.iconify()
+            self.root.after(120, self.root.withdraw)
         if start_threads and self.agent_config.serve_on_start:
             # 和向日葵一样：装好就能被协助，不需要再点一次“开始服务”。
             self.serve_var.set(True)
@@ -1201,7 +1212,9 @@ class DeskWindow:
 
 
 def main() -> None:
-    DeskWindow().run()
+    # 开机自启用 --minimized：只挂托盘、不弹窗（和向日葵一样开机就在右下角躺着）
+    minimized = "--minimized" in sys.argv[1:] or "-min" in sys.argv[1:]
+    DeskWindow(start_minimized=minimized).run()
 
 
 if __name__ == "__main__":

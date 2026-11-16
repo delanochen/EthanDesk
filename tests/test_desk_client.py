@@ -324,3 +324,11 @@ def test_session_denied_shows_a_dialog_not_only_a_corner_status():
         assert window.pages["远程协助"].winfo_exists()
     finally:
         window.root.destroy()
+
+
+def test_hide_on_start_needs_a_tray():
+    from desk.client import hide_on_start
+
+    assert hide_on_start(True, True) is True
+    assert hide_on_start(False, True) is False
+    assert hide_on_start(True, False) is False, "没托盘还藏窗口，人叫不回来"
