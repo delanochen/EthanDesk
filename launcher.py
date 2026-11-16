@@ -1,4 +1,4 @@
-"""打包入口：双击 exe / python launcher.py 都从这里起主控端窗口。
+"""打包入口：双击 exe / python launcher.py 都从这里起统一客户端窗口。
 
 单独包一层是为了让 PyInstaller 只依赖一个明确的入口文件，
 而不是去猜包内 ``__main__``。
@@ -23,9 +23,9 @@ def _setup_frozen_paths() -> None:
 def main() -> None:
     multiprocessing.freeze_support()
     _setup_frozen_paths()
-    from viewer.app import main as viewer_main
+    from desk.client import main as desk_main
 
-    viewer_main()
+    desk_main()
 
 
 if __name__ == "__main__":

@@ -14,10 +14,15 @@ from __future__ import annotations
 
 import queue
 import socket
+import threading
 import time
+import webbrowser
+
+from common.update import check_update
+from common.version import APP_NAME, app_version
 
 PAGES = ("远程协助", "设备", "会话", "设置")
-SETTINGS_PAGES = ("本机信息", "常规", "安全", "网络", "画面")
+SETTINGS_PAGES = ("本机信息", "常规", "安全", "网络", "画面", "版本")
 
 POLICY_CHOICES = (("永不", "never"), ("每日", "daily"), ("每次被控后", "every_session"))
 
@@ -36,7 +41,7 @@ def connect_label(connected: bool) -> str:
 
 
 class DeskWindow:
-    def __init__(self, start_threads: bool = True) -> None:
+    def __init__(self, start_threads: bool = True, enable_tray: bool | None = None) -> None:
         import tkinter as tk
         from tkinter import messagebox, ttk
 
@@ -80,9 +85,14 @@ class DeskWindow:
         ensure_dpi_aware()
         self.root = tk.Tk()
         tk_scaling(self.root)
-        self.root.title("EthanDesk 远程桌面")
+        self.root.title(f"{APP_NAME} 远程桌面 · v{app_version()}")
         self.root.geometry("1280x820")
         self.root.minsize(1080, 700)
+        # 托盘常驻：关窗口只是收起，服务继续跑；退出走托盘菜单
+        self.tray = None
+        self._quitting = False
+        self._tray_hinted = False
+        self._update_checked = False
 
         from ui.theme import format_ident
 
@@ -113,8 +123,13 @@ class DeskWindow:
         self.serve_status = tk.StringVar(value="已关闭")
         self.metric_var = tk.StringVar(value="")
         self.login_info = tk.StringVar(value="未登录")
+        self.version_note = tk.StringVar(value=f"v{app_version()}")
 
         self._build_layout()
+        # 测试或自动化里不该往通知区域塞图标：默认只有在真正启动线程时才挂托盘
+        want_tray = start_threads if enable_tray is None else enable_tray
+        if want_tray:
+            self._setup_tray()
         self.root.after(60, self._drain)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         if start_threads and self.agent_config.serve_on_start:
@@ -124,6 +139,66 @@ class DeskWindow:
         if start_threads and self.viewer_config.password:
             # 存过口令就自动登录中继，首页不该停在“未登录”让人再点一次。
             self.root.after(300, self._login)
+
+    # ---------------------------------------------------------------- 托盘 / 版本
+    def _setup_tray(self) -> None:
+        """右下角托盘图标；没有托盘后端就退化成普通窗口，并在本机信息里写明原因。"""
+        from viewer.tray import TrayController, TrayUnavailable
+
+        try:
+            tray = TrayController(
+                APP_NAME,
+                on_show=lambda: self.root.after(0, self._restore_window),
+                on_quit=lambda: self.root.after(0, self._quit_from_tray),
+                tooltip=f"{APP_NAME} v{app_version()}",
+            )
+            tray.start()
+        except TrayUnavailable as exc:
+            self.version_note.set(f"v{app_version()} · 托盘不可用：{exc}")
+            return
+        except Exception as exc:
+            self.version_note.set(f"v{app_version()} · 托盘不可用：{exc!r}")
+            return
+        self.tray = tray
+
+    def _restore_window(self) -> None:
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except self._tk.TclError:
+            pass
+
+    def _quit_from_tray(self) -> None:
+        self._quitting = True
+        self._on_close()
+
+    def _start_update_check(self, force: bool = False) -> None:
+        if self._update_checked and not force:
+            return
+        self._update_checked = True
+        self.version_note.set(f"v{app_version()} · 正在检查更新…")
+        current = app_version()
+
+        def work() -> None:
+            info = check_update(current)
+            self.viewer_events.put(("update", info) if info else ("update_none", None))
+
+        threading.Thread(target=work, name="ethandesk-update", daemon=True).start()
+
+    def _show_update(self, info: dict) -> None:
+        version = str(info.get("version", ""))
+        current = str(info.get("current", app_version()))
+        self.version_note.set(f"发现新版本 v{version}（当前 v{current}）")
+        self.status_var.set(f"有新版本：v{version}")
+        if self.tray is not None:
+            self.tray.notify(f"发现新版本 v{version}，打开「设置 · 本机信息」查看", APP_NAME)
+        if self._messagebox.askyesno(
+            "发现新版本",
+            f"{APP_NAME} 有新版本 v{version}（当前 v{current}）。\n\n是否打开下载页？",
+            parent=self.root,
+        ):
+            webbrowser.open(str(info.get("url", "")))
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -396,6 +471,7 @@ class DeskWindow:
             "安全": self._panel_security(right),
             "网络": self._panel_network(right),
             "画面": self._panel_picture(right),
+            "版本": self._panel_version(right),
         }
         self._settings_panels = panels
         self._settings_buttons = {}
@@ -432,6 +508,17 @@ class DeskWindow:
 
         ttk.Label(frame, text="日志", style="Section.TLabel").pack(anchor="w", pady=(6, 4))
         self.log = self._log_box(frame, height=8)
+        return frame
+
+    def _panel_version(self, parent):
+        ttk = self._ttk
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text="客户端版本", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(frame, textvariable=self.version_note, style="Muted.TLabel").pack(anchor="w")
+        ttk.Button(frame, text="检查更新",
+                   command=lambda: self._start_update_check(force=True)).pack(anchor="w", pady=8)
+        ttk.Label(frame, text="有新版本时会在状态栏提示，并可直接打开下载页。",
+                  style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
         return frame
 
     def _panel_general(self, parent):
@@ -969,6 +1056,13 @@ class DeskWindow:
             elif kind == "logged_in":
                 self.login_info.set(f"已登录：{payload}")
                 self._refresh_agents()
+                self._start_update_check()
+            elif kind == "update":
+                if isinstance(payload, dict):
+                    self._show_update(payload)
+            elif kind == "update_none":
+                self.version_note.set(f"v{app_version()} · 已是最新")
+                self._append_log("检查更新：已是最新版本")
             elif kind == "error":
                 self.status_var.set(f"错误：{payload}")
                 self._append_log(f"错误：{payload}")
@@ -1015,6 +1109,17 @@ class DeskWindow:
         self.agent_worker.answer_consent(str(payload.get("sid", "")), bool(accepted))
 
     def _on_close(self) -> None:
+        # 有托盘时关窗口只是收起：被控端服务继续跑，双击托盘图标再回来
+        if self.tray is not None and not self._quitting:
+            try:
+                self.root.withdraw()
+            except self._tk.TclError:
+                pass
+            if not self._tray_hinted:
+                self._tray_hinted = True
+                self.tray.notify("EthanDesk 还在后台运行，被协助开关保持原状；双击托盘图标可恢复窗口",
+                                 APP_NAME)
+            return
         try:
             self.agent_worker.stop()
         except Exception:
@@ -1023,6 +1128,9 @@ class DeskWindow:
             self.viewer_worker.stop()
         except Exception:
             pass
+        if self.tray is not None:
+            self.tray.stop()
+            self.tray = None
         self.root.destroy()
 
     def run(self) -> None:

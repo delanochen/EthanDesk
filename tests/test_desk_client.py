@@ -7,7 +7,7 @@ def test_module_imports_without_display():
     import desk.client as client
 
     assert client.PAGES == ("远程协助", "设备", "会话", "设置")
-    assert client.SETTINGS_PAGES == ("本机信息", "常规", "安全", "网络", "画面")
+    assert client.SETTINGS_PAGES == ("本机信息", "常规", "安全", "网络", "画面", "版本")
 
 
 def test_mask_code_hides_digits():
@@ -167,3 +167,80 @@ def test_relay_online_event_is_what_turns_the_label_receivable():
     finally:
         window.root.destroy()
 
+
+
+def test_window_title_carries_the_client_version():
+    import tkinter as tk
+
+    import pytest
+
+    from common.version import APP_VERSION
+    from desk.client import DeskWindow
+
+    try:
+        window = DeskWindow(start_threads=False)
+    except tk.TclError as exc:
+        pytest.skip(f"no display: {exc}")
+    try:
+        assert APP_VERSION in window.root.title()
+    finally:
+        window.root.destroy()
+
+
+def test_settings_has_a_version_page_with_the_current_build():
+    import tkinter as tk
+
+    import pytest
+
+    from common.version import APP_VERSION
+    from desk.client import DeskWindow
+
+    try:
+        window = DeskWindow(start_threads=False)
+    except tk.TclError as exc:
+        pytest.skip(f"no display: {exc}")
+    try:
+        texts = _labels(window.pages["设置"])
+        assert "检查更新" in texts
+        assert APP_VERSION in window.version_note.get()
+    finally:
+        window.root.destroy()
+
+
+def test_close_hides_to_tray_instead_of_stopping_the_service():
+    """有托盘时关窗口只收起：被控端开关不能因为关窗被悄悄关掉。"""
+    import tkinter as tk
+
+    import pytest
+
+    from desk.client import DeskWindow
+
+    calls = []
+    try:
+        window = DeskWindow(start_threads=False)
+    except tk.TclError as exc:
+        pytest.skip(f"no display: {exc}")
+    window.agent_worker.stop = lambda: calls.append("stop")
+    window.viewer_worker.stop = lambda: calls.append("viewer-stop")
+
+    class FakeTray:
+        def notify(self, *_args, **_kwargs):
+            pass
+
+        def stop(self):
+            calls.append("tray-stop")
+
+    try:
+        window.tray = FakeTray()
+        window._on_close()          # 等于点窗口右上角
+        assert calls == [], "关窗不该停服务"
+        assert window.root.state() == "withdrawn"
+
+        window._quit_from_tray()    # 托盘菜单里的退出才算真退出
+        assert "stop" in calls and "viewer-stop" in calls and "tray-stop" in calls
+    finally:
+        window.tray = None
+        try:
+            window.root.destroy()
+        except tk.TclError:
+            pass
