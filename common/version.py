@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 APP_NAME = "EthanDesk"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 # 仓库根目录的 VERSION 文件就是唯一的「最新版本」来源，改它即发布新版本。
 UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/delanochen/EthanDesk/main/VERSION"
