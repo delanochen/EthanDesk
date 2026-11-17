@@ -61,7 +61,9 @@ class _FakeClient:
         self.session = _FakeSession()
         self.opened: list[tuple[str, str]] = []
 
-    async def open_session(self, agent_id: str, code: str):
+    async def open_session(
+        self, agent_id: str, code: str, *, login_user: str = "", login_password: str = ""
+    ):
         self.opened.append((agent_id, code))
         return self.session
 
@@ -108,5 +110,92 @@ def test_manual_settings_take_precedence_over_auto_quality():
     asyncio.run(worker._dispatch(("settings", {"quality": 60, "scale": 0.8, "fps": 10})))
 
     assert worker._auto_quality is False
+
+
+def test_credentials_travel_with_the_connect_command_and_the_reconnect():
+    worker = ViewerWorker(queue.Queue(), queue.Queue())
+    client = _FakeClient()
+    worker._client = client
+    seen: list[dict] = []
+
+    async def fake_open(agent_id, code, login_user="", login_password=""):
+        seen.append({"agent_id": agent_id, "user": login_user, "password": login_password})
+        return _FakeSession()
+
+    client.open_session = fake_open
+    asyncio.run(worker._dispatch(("connect", {
+        "agent_id": "146896644", "code": "1", "user": "Guest", "password": "pw",
+    })))
+
+    assert seen == [{"agent_id": "146896644", "user": "Guest", "password": "pw"}]
+    # 掉线重连必须沿用同一份凭据，否则被控端会立刻拒绝。
+    assert worker._reconnect_user == "Guest"
+    assert worker._reconnect_password == "pw"
+
+
+def test_a_login_refusal_surfaces_as_need_login_not_a_generic_error():
+    from viewer.client import SessionDenied
+
+    worker = ViewerWorker(queue.Queue(), queue.Queue())
+    events: list[tuple[str, object]] = []
+
+    def fake_open(agent_id, code, login_user="", login_password=""):
+        raise SessionDenied("denied", code="bad_credentials", need_login=True)
+
+    worker._client = _FakeClient()
+    worker._client.open_session = fake_open
+    worker._emit = lambda kind, payload=None: events.append((kind, payload))
+    asyncio.run(worker._dispatch(("connect", {"agent_id": "146896644"})))
+
+    assert events[-1][0] == "need_login"
+    assert events[-1][1]["code"] == "bad_credentials"
+
+
+def test_open_session_sends_credentials_as_ascii_headers():
+    from common import credentials as creds
+    from viewer.client import DeskClient
+
+    captured: dict = {}
+
+    class _Ws:
+        async def receive(self):
+            from types import SimpleNamespace
+
+            import aiohttp
+
+            from common.protocol import encode
+
+            return SimpleNamespace(
+                type=aiohttp.WSMsgType.TEXT,
+                data=encode({"t": "session_accept", "sid": "s1"}),
+            )
+
+        async def close(self):
+            pass
+
+    class _Session:
+        async def ws_connect(self, url, **kwargs):
+            captured["url"] = url
+            captured["headers"] = kwargs.get("headers")
+            return _Ws()
+
+    async def scenario():
+        # 绕过构造函数：它会真的开一个 aiohttp.ClientSession，测试里用不上。
+        client = DeskClient.__new__(DeskClient)
+        client.base_url = "https://example.com"
+        client.token = "tkn"
+        client._session = _Session()
+        return await client.open_session(
+            "146896644", login_user="Guest", login_password="p@ss"
+        )
+
+    session = asyncio.run(scenario())
+    headers = captured["headers"]
+    assert headers[creds.HEADER_USER] == creds.encode("Guest")
+    assert headers[creds.HEADER_PASSWORD] == creds.encode("p@ss")
+    # 凭据不能出现在 URL 里：那会被反代的访问日志记下来。
+    assert "p@ss" not in captured["url"] and "Guest" not in captured["url"]
+    assert session is not None
+
 
 

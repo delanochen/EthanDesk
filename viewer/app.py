@@ -23,7 +23,7 @@ from common.protocol import BinaryPairer, encode, make_bin_header
 from common.defaults import DEFAULT_VIEWER_URL
 from common.update import check_update
 from common.version import APP_NAME, app_version
-from viewer.client import DeskClient, DeskClientError, Session
+from viewer.client import DeskClient, DeskClientError, Session, SessionDenied
 from viewer.config import ViewerConfig
 from viewer.tray import TrayController, TrayUnavailable
 
@@ -137,6 +137,9 @@ class ViewerWorker:
         # close was the user's own doing (断开) or a fault the viewer should heal itself.
         self._reconnect_agent = ""
         self._reconnect_code = ""
+        # 被控端要求账户门禁时，重连也要带上同一份凭据，否则掉线后就再也连不回去。
+        self._reconnect_user = ""
+        self._reconnect_password = ""
         self._manual_disconnect = False
         self._reconnect_task: asyncio.Task | None = None
 
@@ -235,6 +238,12 @@ class ViewerWorker:
                 self._clip_enabled = bool(payload)
             elif action == "shutdown":
                 self._stopping = True
+        except SessionDenied as exc:
+            # 被控端要求账户验证时单独发事件，界面才能弹出用户名/密码输入。
+            if exc.need_login:
+                self._emit("need_login", {"code": exc.code, "text": str(exc)})
+            else:
+                self._emit("error", str(exc))
         except DeskClientError as exc:
             self._emit("error", str(exc))
         except Exception as exc:  # surface unexpected faults instead of dying silently
@@ -335,8 +344,11 @@ class ViewerWorker:
         if isinstance(payload, dict):
             agent_id = str(payload.get("agent_id", ""))
             code = str(payload.get("code", ""))
+            login_user = str(payload.get("user", "") or "")
+            login_password = str(payload.get("password", "") or "")
         else:
             agent_id, code = str(payload), ""
+            login_user = login_password = ""
         if not agent_id:
             self._emit("error", "缺少设备 ID")
             return
@@ -344,9 +356,11 @@ class ViewerWorker:
         self._manual_disconnect = False
         self._reconnect_agent = agent_id
         self._reconnect_code = code
+        self._reconnect_user = login_user
+        self._reconnect_password = login_password
         await self._teardown()
         self._emit("status", f"正在连接 {agent_id}…")
-        session = await self._open_session(agent_id, code)
+        session = await self._open_session(agent_id, code, login_user, login_password)
         self._session = session
         self._pairer = BinaryPairer()
         self._incoming = {}
@@ -358,7 +372,9 @@ class ViewerWorker:
         self._emit("session_open", agent_id)
         asyncio.create_task(self._receive_loop(session))
 
-    async def _open_session(self, agent_id: str, code: str):
+    async def _open_session(
+        self, agent_id: str, code: str, login_user: str = "", login_password: str = ""
+    ):
         """开会话；撞上 agent_busy 时自动等被控端收尾再试。
 
         只重试 agent_busy：口令错、被控端离线、对方拒绝协助之类要立刻让用户看到。
@@ -367,7 +383,12 @@ class ViewerWorker:
         attempt = 0
         while True:
             try:
-                return await self._client.open_session(agent_id, code)
+                return await self._client.open_session(
+                    agent_id,
+                    code,
+                    login_user=login_user,
+                    login_password=login_password,
+                )
             except DeskClientError as exc:
                 if getattr(exc, "code", "") != "agent_busy" or attempt >= VIEWER_BUSY_RETRIES:
                     raise
@@ -434,7 +455,14 @@ class ViewerWorker:
                     return
                 agent_id = self._reconnect_agent
                 try:
-                    await self._connect({"agent_id": agent_id, "code": self._reconnect_code})
+                    await self._connect(
+                        {
+                            "agent_id": agent_id,
+                            "code": self._reconnect_code,
+                            "user": self._reconnect_user,
+                            "password": self._reconnect_password,
+                        }
+                    )
                 except DeskClientError as exc:
                     self._emit("log", f"重连未成功：{exc}")
                     delay = min(delay * 1.5, VIEWER_RECONNECT_MAX_DELAY)

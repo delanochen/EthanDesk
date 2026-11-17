@@ -72,6 +72,12 @@ def is_self_target(target: str, own_id: str) -> bool:
     return bool(target_id) and target_id == own
 
 
+def _split_accounts(text: str) -> list[str]:
+    """「允许的账户」输入框：中英文逗号、分号、空白都能当分隔符。"""
+    raw = str(text or "").replace("，", ",").replace("；", ",").replace(";", ",")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def hide_on_start(start_minimized: bool, has_tray: bool) -> bool:
     """开机自启只在有托盘时才藏起来——没托盘还藏，人就没法把它叫回来。"""
     return bool(start_minimized and has_tray)
@@ -147,9 +153,15 @@ class DeskWindow:
         self.allow_var = tk.BooleanVar(value=bool(self.agent_config.allow_input))
         self.clip_var = tk.BooleanVar(value=bool(self.agent_config.clipboard_sync))
         self.unattended_var = tk.BooleanVar(value=bool(self.agent_config.unattended))
+        # 连接本机前要不要先验证 Windows 账户；允许账户留空表示本机任意账户都行。
+        self.require_login_var = tk.BooleanVar(value=bool(self.agent_config.require_login))
+        self.login_accounts_var = tk.StringVar(value=", ".join(self.agent_config.login_accounts))
         self.policy_var = tk.StringVar(value=self._policy_label(self.agent_config.session_code_policy))
         self.peer_var = tk.StringVar()
         self.peer_code_var = tk.StringVar()
+        # 对方开了「连接前必须验证电脑账户」时，这里填那台机器的 Windows 用户名和密码。
+        self.peer_user_var = tk.StringVar()
+        self.peer_password_var = tk.StringVar()
         self.quality_var = tk.IntVar(value=int(self.agent_config.quality))
         self.scale_var = tk.DoubleVar(value=float(self.agent_config.scale))
         self.fps_var = tk.IntVar(value=int(self.agent_config.fps))
@@ -388,6 +400,15 @@ class DeskWindow:
                    command=self._connect_peer).pack(side="left", padx=14)
         ttk.Label(peer_row, text="伙伴识别码 － 验证码（可为空）", style="Muted.TLabel").pack(side="left", padx=8)
 
+        account_row = ttk.Frame(page)
+        account_row.pack(fill="x", pady=(8, 0))
+        ttk.Entry(account_row, textvariable=self.peer_user_var, width=28).pack(side="left")
+        ttk.Label(account_row, text="/", style="Muted.TLabel").pack(side="left", padx=4)
+        ttk.Entry(account_row, textvariable=self.peer_password_var, width=18,
+                  show="*").pack(side="left")
+        ttk.Label(account_row, text="对方要求验证电脑账户时填写：Windows 用户名 / 密码",
+                  style="Muted.TLabel").pack(side="left", padx=8)
+
         mode = ttk.Frame(page)
         mode.pack(anchor="w", pady=(10, 0))
         self.file_mode_var = tk.StringVar(value="desktop")
@@ -577,6 +598,15 @@ class DeskWindow:
                         command=self._apply_agent_settings).pack(anchor="w", pady=4)
         ttk.Checkbutton(frame, text="无人值守（凭验证码免确认）", variable=self.unattended_var,
                         command=self._apply_code_policy).pack(anchor="w", pady=4)
+
+        ttk.Checkbutton(frame, text="连接前必须验证电脑账户（Windows 用户名 + 密码）",
+                        variable=self.require_login_var,
+                        command=self._apply_agent_settings).pack(anchor="w", pady=(10, 4))
+        account_row = ttk.Frame(frame)
+        account_row.pack(anchor="w")
+        ttk.Entry(account_row, textvariable=self.login_accounts_var, width=32).pack(side="left")
+        ttk.Label(account_row, text="允许的账户，逗号分隔；留空=本机任意账户",
+                  style="Muted.TLabel").pack(side="left", padx=8)
         ttk.Label(frame, text="验证码更新", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
         self._policy_row(frame)
         ttk.Label(frame, text="接收文件保存位置", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
@@ -810,7 +840,12 @@ class DeskWindow:
         self.remote_notice.set("")
         self.viewer_commands.put(("login", {"url": self.viewer_url_var.get().strip(),
                                            "password": self.password_var.get()}))
-        self.viewer_commands.put(("connect", {"agent_id": agent_id, "code": self.peer_code_var.get().strip()}))
+        self.viewer_commands.put(("connect", {
+            "agent_id": agent_id,
+            "code": self.peer_code_var.get().strip(),
+            "user": self.peer_user_var.get().strip(),
+            "password": self.peer_password_var.get(),
+        }))
         self.status_var.set(f"正在连接 {agent_id}…")
         self._show_page("会话")
 
@@ -828,8 +863,12 @@ class DeskWindow:
         self.remote_notice.set("")
         self.viewer_commands.put(("login", {"url": self.viewer_url_var.get().strip(),
                                            "password": self.password_var.get()}))
-        self.viewer_commands.put(("connect", {"agent_id": selection[0],
-                                             "code": self.peer_code_var.get().strip()}))
+        self.viewer_commands.put(("connect", {
+            "agent_id": selection[0],
+            "code": self.peer_code_var.get().strip(),
+            "user": self.peer_user_var.get().strip(),
+            "password": self.peer_password_var.get(),
+        }))
         self.status_var.set("等待被控端确认…")
         self._show_page("会话")
 
@@ -907,10 +946,14 @@ class DeskWindow:
     def _apply_agent_settings(self) -> None:
         self.agent_config.allow_input = bool(self.allow_var.get())
         self.agent_config.clipboard_sync = bool(self.clip_var.get())
+        self.agent_config.require_login = bool(self.require_login_var.get())
+        self.agent_config.login_accounts = _split_accounts(self.login_accounts_var.get())
         self._save_agent_config()
         try:
             self.agent_worker.apply_settings(allow_input=self.allow_var.get(),
-                                            clipboard_sync=self.clip_var.get())
+                                            clipboard_sync=self.clip_var.get(),
+                                            require_login=self.require_login_var.get(),
+                                            login_accounts=list(self.agent_config.login_accounts))
         except Exception:
             pass
 
@@ -1140,11 +1183,29 @@ class DeskWindow:
                 self._append_log("检查更新：已是最新版本")
             elif kind == "error":
                 self._raise_session_error(payload)
+            elif kind == "need_login":
+                self._ask_credentials(payload)
             elif kind == "log":
                 self.status_var.set(str(payload))
             elif kind == "file_saved":
                 self._append_log(f"文件已保存：{payload}")
         self.root.after(60, self._drain)
+
+    def _ask_credentials(self, payload) -> None:
+        """被控端要求账户验证：把原因写清楚，让人去填用户名/密码再连一次。"""
+        code = str((payload or {}).get("code") or "")
+        hint = {
+            "account_not_allowed": "这个账户不在对方允许的名单里。",
+            "bad_credentials": "账户或密码不正确。",
+        }.get(code, "对方要求先用那台电脑的 Windows 账户验证。")
+        self.remote_notice.set(hint)
+        self.connected = False
+        self._show_page("远程协助")
+        self._append_log(f"需要账户验证：{hint}")
+        self._messagebox.showwarning(
+            "需要账户验证",
+            f"{hint}\n\n在「远程协助他人」里填好那台电脑的用户名和密码，再点连接。",
+        )
 
     def _raise_session_error(self, payload) -> None:
         """会话类错误（被拒/离线/占用）要弹窗 + 页面上红字，不能只在状态栏角落留一行。"""

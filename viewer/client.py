@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 import aiohttp
 
+from common import credentials
 from common.protocol import ProtocolError, decode, encode
 
 
@@ -21,6 +22,14 @@ class DeskClientError(Exception):
     def __init__(self, message: str, code: str = "") -> None:
         super().__init__(message)
         self.code = code
+
+
+class SessionDenied(DeskClientError):
+    """会话被拒；``need_login`` 表示被控端要求先验证那台电脑的 Windows 账户。"""
+
+    def __init__(self, message: str, code: str = "", need_login: bool = False) -> None:
+        super().__init__(message, code)
+        self.need_login = need_login
 
 
 def to_http_base(base_url: str) -> str:
@@ -136,7 +145,14 @@ class DeskClient:
             raise DeskClientError(f"读取会话记录失败：HTTP {response.status}")
         return list((await response.json()).get("sessions", []))
 
-    async def open_session(self, agent_id: str, code: str = "") -> Session:
+    async def open_session(
+        self,
+        agent_id: str,
+        code: str = "",
+        *,
+        login_user: str = "",
+        login_password: str = "",
+    ) -> Session:
         if not self.token:
             await self.login()
         url = (
@@ -144,8 +160,15 @@ class DeskClient:
         )
         if code:
             url += f"&code={quote(code)}"
+        headers: dict[str, str] = {}
+        if login_user or login_password:
+            # 被控端要求账户门禁时用得上；中继只转发，不解释。
+            headers[credentials.HEADER_USER] = credentials.encode(login_user)
+            headers[credentials.HEADER_PASSWORD] = credentials.encode(login_password)
         try:
-            ws = await self._session.ws_connect(url, heartbeat=30, max_msg_size=0)
+            ws = await self._session.ws_connect(
+                url, heartbeat=30, max_msg_size=0, headers=headers or None
+            )
         except aiohttp.ClientError as exc:
             raise DeskClientError(f"建立会话失败：{exc}") from exc
 
@@ -155,8 +178,9 @@ class DeskClient:
             if payload.get("t") == "session_accept":
                 return session
             code = payload.get("code", "unknown")
+            need_login = bool(payload.get("need_login"))
             await session.close()
-            raise DeskClientError(f"会话被拒绝：{code}", code=str(code))
+            raise SessionDenied(f"会话被拒绝：{code}", code=str(code), need_login=need_login)
         await session.close()
         raise DeskClientError("会话握手未完成")
 

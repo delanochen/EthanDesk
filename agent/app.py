@@ -19,7 +19,7 @@ from typing import Any
 
 import aiohttp
 
-from agent import clip, inject, screen
+from agent import clip, inject, screen, winlogin
 from agent.config import AgentConfig
 from agent.files_transfer import FileTransferError, IncomingFile, OutgoingFile
 from common import session_code
@@ -161,6 +161,10 @@ class AgentWorker:
             self._allow_input = bool(kwargs["allow_input"])
         if "clipboard_sync" in kwargs:
             self._clipboard_sync = bool(kwargs["clipboard_sync"])
+        if "require_login" in kwargs:
+            self.config.require_login = bool(kwargs["require_login"])
+        if "login_accounts" in kwargs:
+            self.config.login_accounts = [str(item) for item in (kwargs["login_accounts"] or [])]
         if "quality" in kwargs:
             self._quality = int(kwargs["quality"])
         if "scale" in kwargs:
@@ -405,24 +409,40 @@ class AgentWorker:
             finally:
                 self._incoming.pop(transfer_id, None)
 
+    def _verify_login(self, user: str, password: str) -> tuple[bool, str]:
+        """账户门禁。单独成方法，测试里可以替换掉，不必真的调 Win32 登录。"""
+        return winlogin.verify(user, password, self.config.login_accounts)
+
     async def _ask_consent(self, ws: aiohttp.ClientWebSocketResponse, message: dict) -> None:
         session_id = str(message.get("sid", ""))
         viewer = str(message.get("viewer", "viewer"))
         if self._active_session:
-            await ws.send_str(encode({"t": "session_denied", "sid": session_id}))
+            await ws.send_str(encode({"t": "session_denied", "sid": session_id, "code": "agent_busy"}))
             return
-        if self.config.session_code_policy == POLICY_DAILY and session_code.should_rotate(
-            POLICY_DAILY, self.config.code_rotated_at
-        ):
-            self.config.rotate_session_code()
-            self._save_config()
-            self._emit("log", f"验证码已更新：{self.config.session_code}")
 
-        code = str(message.get("code", ""))
-        if self.config.unattended and session_code.matches(self.config.session_code, code):
+        # 账户门禁优先于验证码和人工确认：开了就只认 Windows 账户密码。
+        if self.config.require_login:
+            user = str(message.get("user", "") or "")
+            ok, reason = self._verify_login(user, str(message.get("password", "") or ""))
+            if not ok:
+                hint = (
+                    "该账户不在允许名单" if reason == winlogin.ACCOUNT_NOT_ALLOWED else "账户或密码不正确"
+                )
+                await ws.send_str(
+                    encode(
+                        {
+                            "t": "session_denied",
+                            "sid": session_id,
+                            "code": reason,
+                            "need_login": True,
+                        }
+                    )
+                )
+                self._emit("log", f"拒绝 {viewer}：{hint}")
+                return
             self._active_session = session_id
             await ws.send_str(encode({"t": "session_accept", "sid": session_id}))
-            self._emit("log", f"{viewer} 凭验证码免确认接入（无人值守）")
+            self._emit("log", f"{viewer} 通过账户验证接入（{winlogin.normalise_account(user)}）")
             return
 
         if self.config.session_code_policy == POLICY_DAILY and session_code.should_rotate(

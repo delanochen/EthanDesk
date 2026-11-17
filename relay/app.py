@@ -22,6 +22,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 from common.auth import AuthError, issue_token, verify_token
+from common import credentials
 from common.protocol import ProtocolError, decode, encode
 from relay.config import RelayConfig
 from relay.registry import Registry, SessionLog
@@ -65,11 +66,15 @@ class AgentLink:
         self.active = True
 
     def resolve(self, message: dict[str, Any]) -> bool:
-        """Complete the pending consent request when the sid matches."""
+        """Complete the pending consent request when the sid matches.
+
+        保留被控端原话（``code`` / ``need_login``），否则主控端只知道"被拒了"，
+        没法告诉用户到底是密码错还是账户不在名单里。
+        """
         if self._future is None or message.get("sid") != self._pending_sid:
             return False
         if not self._future.done():
-            self._future.set_result("accept" if message.get("t") == "session_accept" else "deny")
+            self._future.set_result(message)
         return True
 
     def detach(self) -> None:
@@ -256,6 +261,9 @@ async def handle_viewer_ws(request: web.Request) -> web.WebSocketResponse:
 
     agent_id = request.query.get("agent_id", "")
     viewer_name = str(payload.get("sub", "viewer"))
+    # 账户门禁凭据：中继只做透明转发，验证在被控端本机完成（中继没有 Windows 环境）。
+    login_user = credentials.decode(request.headers.get(credentials.HEADER_USER, ""))
+    login_password = credentials.decode(request.headers.get(credentials.HEADER_PASSWORD, ""))
 
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=0, autoping=True)
     await ws.prepare(request)
@@ -278,13 +286,21 @@ async def handle_viewer_ws(request: web.Request) -> web.WebSocketResponse:
     code = request.query.get("code", "")
     if not await _send(
         link.ws,
-        {"t": "session_request", "sid": session_id, "viewer": viewer_name, "code": code},
+        {
+            "t": "session_request",
+            "sid": session_id,
+            "viewer": viewer_name,
+            "code": code,
+            "user": login_user,
+            "password": login_password,
+        },
     ):
         link.detach()
         await _send(ws, {"t": "error", "code": "agent_offline", "agent_id": agent_id})
         await ws.close()
         return ws
 
+    decision = None
     try:
         decision = await asyncio.wait_for(future, config.session_accept_timeout)
     except asyncio.TimeoutError:
@@ -293,9 +309,16 @@ async def handle_viewer_ws(request: web.Request) -> web.WebSocketResponse:
         await ws.close()
         return ws
 
-    if decision != "accept":
+    if not isinstance(decision, dict) or decision.get("t") != "session_accept":
         link.detach()
-        await _send(ws, {"t": "error", "code": "session_denied"})
+        denied: dict[str, Any] = {"t": "error", "code": "session_denied"}
+        if isinstance(decision, dict):
+            # 透传被控端给的原因，主控端才能提示"密码错"还是"账户不在名单"。
+            if decision.get("code"):
+                denied["code"] = str(decision["code"])
+            if decision.get("need_login"):
+                denied["need_login"] = True
+        await _send(ws, denied)
         await ws.close()
         return ws
 

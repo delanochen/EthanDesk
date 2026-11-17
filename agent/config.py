@@ -57,6 +57,9 @@ class AgentConfig:
     verify_cert: bool = True
     # 首页「允许他人协助本机」的开关状态：装上即可被协助，关掉的选择要记住。
     serve_on_start: bool = True
+    # 连接本机前必须先用 Windows 账户验证；留空名单表示本机任意账户都能通过验证。
+    require_login: bool = False
+    login_accounts: list[str] = field(default_factory=list)
 
     def info(self) -> dict:
         return {

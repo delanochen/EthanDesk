@@ -32,7 +32,9 @@ class _Client:
         self.script = script
         self.calls: list[tuple[str, str]] = []
 
-    async def open_session(self, agent_id: str, code: str = "") -> _Session:
+    async def open_session(
+        self, agent_id: str, code: str = "", *, login_user: str = "", login_password: str = ""
+    ) -> _Session:
         self.calls.append((agent_id, code))
         item = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
         if isinstance(item, Exception):
