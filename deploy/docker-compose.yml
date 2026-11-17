@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: deskrelay:1.0.1
+    image: deskrelay:1.3.3
     container_name: deskrelay
     restart: unless-stopped
     env_file:
